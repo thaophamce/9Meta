@@ -1,6 +1,6 @@
 {
   "name": "9meta",
-  "version": "2.5.40",
+  "version": "2.5.53",
   "description": "Nhà Yến Zalo - Quản lý nhiều tài khoản, người dùng và nhóm Zalo trên Desktop.",
   "main": "main.js",
   "scripts": {
@@ -46,10 +46,11 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "shortcutName": "Nhà Yến Zalo",
-      "artifactName": "Nha-Yen-Zalo-Setup-${version}.${ext}"
+      "artifactName": "Nha-Yen-Zalo-Setup-${version}.${ext}",
+      "include": "build/installer-access-code.nsh"
     },
     "releaseInfo": {
-      "releaseNotes": "1) Fix lỗi mất tin nhắn Zalo bất thường: tab Zalo chạy ngầm không bị chậm, tự tải lại khi mất mạng/crash, thêm nút Dọn cache (giữ đăng nhập) trong Chỉnh sửa tài khoản. 2) Tạo đơn Pancake lấy mã đơn và sao chép nhanh. 3) Tab Pancake hoạt động ổn định; ô tìm đổi nhãn \"Tìm sản phẩm\" và ưu tiên kết quả khớp đúng tên lên đầu. 4) Tin nhắn nhanh có nút Chèn và gõ \\ để chọn nhanh."
+      "releaseNotes": "2.5.53:\n- Sửa lỗi Tạo đơn báo \"Chưa có thông tin kho hàng\": tách rõ nguyên nhân lỗi tải danh sách kho, hiển thị lý do chi tiết và hướng dẫn mở tab Pancake để tải lại.\n- Đơn thiết kế: thêm 3 thuộc tính GẤP / Có phí thiết kế (100.000đ) / Outsource, đồng bộ 2 chiều với Nhà Yến POS, chỉ lưu khi bấm Tạo/Cập nhật.\n- Đơn thiết kế: thêm khối Lịch sử hoạt động (tạo đơn, đổi trạng thái/Designer/deadline/số mẫu/ghi chú, bật/tắt GẤP/Có phí/Outsource) dùng lịch sử chung của POS.\n- Pancake: cho phép Tạo đơn nhanh không cần sản phẩm (items: []), đơn 0đ, không tự gắn \"Tiền đặt cọc\"/sản phẩm giả, có nút Hủy đơn thử.\n- Ổn định phiên Zalo và các sửa nhỏ khác từ nhánh 2.5.42-ctotest."
     },
     "publish": [
       {
@@ -57,13 +58,22 @@
         "owner": "thaophamce",
         "repo": "nhayen-zalo-updates"
       }
+    ],
+    "extraResources": [
+      {
+        "from": "assets/default-videos",
+        "to": "default-videos",
+        "filter": [
+          "**/*"
+        ]
+      }
     ]
   },
   "author": "Tiodev71",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^29.0.0",
-    "electron-builder": "^24.13.3"
+    "electron": "44.3.0",
+    "electron-builder": "26.15.3"
   },
   "dependencies": {
     "cloudflared": "^0.7.3",

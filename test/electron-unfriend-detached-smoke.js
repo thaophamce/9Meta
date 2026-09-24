@@ -1,4 +1,4 @@
-const { app, BrowserWindow, BrowserView } = require('electron');
+const { app, BrowserWindow, WebContentsView } = require('electron');
 const { buildUnfriendStepScript } = require('../modules/zalo-user-management');
 
 app.disableHardwareAcceleration();
@@ -34,11 +34,11 @@ const fixture = `<!doctype html><html><body>
 
 app.whenReady().then(async () => {
   const win = new BrowserWindow({ show: false });
-  const view = new BrowserView();
-  win.setBrowserView(view);
+  const view = new WebContentsView();
+  win.contentView.addChildView(view);
   view.setBounds({ x: 0, y: 0, width: 900, height: 700 });
   await view.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`);
-  win.setBrowserView(null);
+  win.contentView.removeChildView(view);
 
   const user = { userId: '123', name: 'Tên Zalo', zaloName: 'Tên Zalo' };
   for (const stage of ['CONTACTS', 'FRIEND_LIST', 'SEARCH', 'MORE', 'DELETE', 'CONFIRM', 'VERIFY']) {
@@ -48,7 +48,7 @@ app.whenReady().then(async () => {
       new Promise((resolve) => setTimeout(() => resolve({ ok: false, timeout: true, stage }), 2_000)),
     ]);
     if (!result?.ok) throw new Error(`${stage}: ${JSON.stringify(result)}`);
-    if (Date.now() - startedAt >= 2_000) throw new Error(`${stage}: exceeded detached BrowserView deadline`);
+    if (Date.now() - startedAt >= 2_000) throw new Error(`${stage}: exceeded detached WebContentsView deadline`);
     await new Promise((resolve) => setTimeout(resolve, 40));
   }
   console.log('DETACHED_BROWSER_VIEW_UNFRIEND_OK');

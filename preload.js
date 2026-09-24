@@ -1,4 +1,4 @@
-// Preload nay chay trong sandbox (Electron >= 20 bat sandbox mac dinh cho BrowserView),
+// Preload nay chay trong sandbox (Electron >= 20 bat sandbox mac dinh cho WebContentsView),
 // nen CHI duoc require('electron'). Moi require khac (fs, path, ...) se lam ca preload
 // khong load duoc -> mat contextBridge va mat cac listener IPC quet nhom/nguoi dung.
 const { contextBridge, ipcRenderer, webFrame } = require('electron');
@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('messengerApp', {
   sendCurrentChatInfo: (info) => ipcRenderer.send('current-chat-info-extracted', info),
   sendRecentChats: (chats) => ipcRenderer.send('recent-chats-extracted', chats),
   sendUnreadConversationCount: (count) => ipcRenderer.send('profile-unread-count', count),
+  sendUnreadCountDetail: (payload) => ipcRenderer.send('profile-unread-count-detail', payload),
+  sendConvDiag: (payload) => ipcRenderer.send('conv-diag', payload),
   sendTextToActiveChat: (message) => ipcRenderer.invoke('active-chat-send-text', message),
   emitZaloGroupScanEvent: (payload) => ipcRenderer.send('zalo-group-scan:event', payload),
   emitZaloUserScanEvent: (payload) => ipcRenderer.send('zalo-user-scan:event', payload),
@@ -25,6 +27,12 @@ contextBridge.exposeInMainWorld('messengerApp', {
 // Neu main process chua kip dang ky listener thi sendSync tra ve undefined;
 // dung object rong de preload khong bao gio chet giua duong (mat bridge + mat listener quet).
 const settings = ipcRenderer.sendSync('get-settings') || {};
+if (typeof window.addEventListener === 'function') {
+  const reportNetworkState = () => ipcRenderer.send('zalo-network-state', { online: navigator.onLine !== false });
+  window.addEventListener('online', reportNetworkState);
+  window.addEventListener('offline', reportNetworkState);
+  setTimeout(reportNetworkState, 0);
+}
 // Font Quicksand duoc main process doc tu dia va gui kem theo get-settings,
 // vi preload sandbox khong the tu doc file.
 const quicksandFontDataUrl = (settings && settings.quicksandFontDataUrl) || '';
@@ -472,64 +480,220 @@ function runInjection(currentSettings) {
       // Chạy trong main world của Zalo giống cơ chế ổn định trước đây.
       setTimeout(setupQuickReplyShortcuts, 3000);
 
-      // Auto extract recent chats
-      function extractRecentChats() {
-        if (!isZalo) return;
-        var chats = [];
-        try {
-          function normalizeChatText(value) {
-            return String(value || '')
-              .normalize('NFC')
-              .replace(/[\u200B-\u200D\uFEFF]/g, '')
-              .replace(/\s+/g, ' ')
-              .trim();
-          }
-          function isBlockedChatName(name) {
-            var blocked = ['tin nhắn', 'danh bạ', 'zalo cloud', 'công cụ', 'giao việc', 'lịch sử đồng bộ', 'cài đặt'];
-            var lower = normalizeChatText(name).toLowerCase();
-            return blocked.some(function(keyword) { return lower === keyword || lower.includes(keyword); });
-          }
-          var items = document.querySelectorAll('.msg-item, [data-id], .group-board-item');
-          items.forEach(function(item) {
-            var nameEl = item.querySelector('.conv-item-title__name, .item-title__name, .item-title, .truncate');
-            var looksLikeChat = item.querySelector('img, .avatar, .zavatar, .conv-item-title__name, .item-title__name');
-            if (nameEl && looksLikeChat) {
-               var name = normalizeChatText(nameEl.innerText || nameEl.textContent || '');
-               if (name && !chats.includes(name) && !isBlockedChatName(name)) {
-                  chats.push(name);
-               }
-            }
-          });
-          window.messengerApp.sendRecentChats(chats);
-        } catch (e) {}
-      }
-      setInterval(extractRecentChats, 6000);
+      // Bo loc hoi thoai Zalo: Tat ca / Ca nhan (unread) / Nhom (unread).
+      // Chi toggle display — khong click, khong doi class unread, khong scroll -> KHONG tu danh dau da doc.
+      // Logic phan loai inline tu modules/conv-classify.js (preload sandbox khong require ngoai electron).
+      window.__NY_FILTER_MODE = window.__NY_FILTER_MODE || 'all';
 
-      // Đếm số HỘI THOẠI có ít nhất một tin chưa đọc, không cộng tổng số tin.
-      function extractUnreadConversationCount() {
-        if (!isZalo) return;
-        try {
-          var rows = Array.from(document.querySelectorAll('.msg-item, [class*="conv-item" i], [data-id]'));
-          var seen = new Set();
-          var count = 0;
-          rows.forEach(function(row) {
-            if (!row || !row.querySelector) return;
-            var badge = row.querySelector('[class*="unread" i], [class*="badge" i], [class*="notify" i], [data-unread="true"]');
-            if (!badge) return;
-            var rect = badge.getBoundingClientRect && badge.getBoundingClientRect();
-            var style = window.getComputedStyle ? window.getComputedStyle(badge) : null;
-            if (!rect || rect.width <= 0 || rect.height <= 0 || (style && (style.display === 'none' || style.visibility === 'hidden'))) return;
-            var text = String(badge.textContent || '').trim();
-            var className = String(badge.className || '');
-            if (!text && !/unread|notify/i.test(className) && badge.getAttribute('data-unread') !== 'true') return;
-            var key = row.getAttribute('data-id') || row.getAttribute('id') || String(rows.indexOf(row));
-            if (!seen.has(key)) { seen.add(key); count += 1; }
+      function __nyClassifyConversation(input) {
+        var dataId = String((input && input.dataId) || '');
+        var className = String((input && input.className) || '');
+        var ariaLabel = String((input && input.ariaLabel) || '');
+        var title = String((input && input.title) || '');
+        var bodyText = String((input && input.bodyText) || '');
+        var avatarCount = Number((input && input.avatarCount) || 0) || 0;
+        var hasGroupIcon = !!(input && input.hasGroupIcon);
+        // Tin xem truoc cua nhom luon co tien to ten nguoi gui ("Emin:", "Tuấn Gai:");
+        // chat 1-1 thi khong (hoac "Bạn:"). Day la dau hieu dang tin nhat trong DOM Zalo web.
+        var m = bodyText.match(/^\\s*([^:\\n]{1,40}):\\s/);
+        if (m) {
+          var who = m[1].trim().toLowerCase();
+          if (who && who !== 'bạn' && who !== 'ban' && who !== 'you') return 'group';
+        }
+        if (/(^|[^a-z])(group|grp)[_-]/i.test(dataId)) return 'group';
+        if (/\\bgroup\\b/i.test(className)) return 'group';
+        if (/(nh[oó]m|group)/i.test(ariaLabel) || /(nh[oó]m|group)/i.test(title)) return 'group';
+        if (avatarCount >= 3) return 'group';
+        if (hasGroupIcon) return 'group';
+        return 'personal';
+      }
+
+      function __nyIsUnreadRow(row) {
+        if (!row || !row.querySelector) return false;
+        var badge = row.querySelector('[class*="unread" i], [class*="badge" i], [class*="notify" i], [data-unread="true"]');
+        if (!badge) return false;
+        var rect = badge.getBoundingClientRect && badge.getBoundingClientRect();
+        var style = window.getComputedStyle ? window.getComputedStyle(badge) : null;
+        if (!rect || rect.width <= 0 || rect.height <= 0 || (style && (style.display === 'none' || style.visibility === 'hidden'))) return false;
+        var text = String(badge.textContent || '').trim();
+        var className = String(badge.className || '');
+        if (!text && !/unread|notify/i.test(className) && badge.getAttribute('data-unread') !== 'true') return false;
+        return true;
+      }
+
+      function __nyNormalizeChatText(value) {
+        return String(value || '')
+          .normalize('NFC')
+          .replace(/[\u200B-\u200D\uFEFF]/g, '')
+          .replace(/\\s+/g, ' ')
+          .trim();
+      }
+
+      function __nyTokenHas(el, token) {
+        if (!el || !el.classList) return false;
+        try { return el.classList.contains(token); } catch (e) { return false; }
+      }
+
+      function __nyCollectConversationRows() {
+        if (!isZalo) return [];
+        // Dong that cua Zalo web = phan tu co TOKEN class 'conv-item' (khong phai conv-item__avatar /
+        // conv-item-title__name / conv-item-body / conv-unread-react). Dung '.conv-item' (token)
+        // de khong vo cac phan tu con giong nhu '[class*=conv-item]'.
+        var inner = Array.from(document.querySelectorAll('.conv-item'));
+        var seenEl = new Set();
+        var seenKey = new Set();
+        var out = [];
+        inner.forEach(function(cell) {
+          if (!cell || !cell.querySelector) return;
+          // An toan theo wrapper .msg-item (tat wrapper de khong de lai cho trong), neu khong co thi dung chinh no.
+          var row = (cell.closest && cell.closest('.msg-item')) || cell;
+          if (seenEl.has(row)) return;
+          seenEl.add(row);
+          var key = row.getAttribute('data-id') || row.getAttribute('id') || '';
+          if (!key) key = 'k:' + out.length;
+          if (seenKey.has(key)) return;
+          seenKey.add(key);
+          var nameEl = row.querySelector('.conv-item-title__name, .item-title__name, .item-title, .truncate');
+          var name = nameEl ? __nyNormalizeChatText(nameEl.innerText || nameEl.textContent || '') : '';
+          var bodyEl = row.querySelector('.conv-item-body, [class*="conv-item-body"]');
+          var bodyText = bodyEl ? __nyNormalizeChatText(bodyEl.innerText || bodyEl.textContent || '') : '';
+          var unread = __nyIsUnreadRow(row);
+          var typed = __nyClassifyConversation({
+            dataId: row.getAttribute('data-id') || '',
+            className: String(row.className || ''),
+            ariaLabel: String(row.getAttribute('aria-label') || ''),
+            title: String(row.getAttribute('title') || name || ''),
+            bodyText: bodyText,
+            avatarCount: row.querySelectorAll('img,.avatar,.zavatar').length,
+            hasGroupIcon: !!row.querySelector('[class*="group" i]')
           });
-          window.messengerApp.sendUnreadConversationCount(count);
+          out.push({ el: row, id: key, name: name, unread: unread, type: typed, bodyText: bodyText });
+        });
+        return out;
+      }
+
+      function __nyApplyFilter(rows) {
+        // Read-only by design. Zalo owns row visibility for its virtualized list.
+        // Mutating inline display here can desynchronize React state and hide history.
+        return rows;
+      }
+
+      function __nyEmitCounts(rows) {
+        var personalUnread = 0, groupUnread = 0;
+        rows.forEach(function(r) { if (r && r.unread) { if (r.type === 'group') groupUnread += 1; else personalUnread += 1; } });
+        var total = personalUnread + groupUnread;
+        try { window.messengerApp.sendUnreadConversationCount(total); } catch (e) {}
+        try { window.messengerApp.sendUnreadCountDetail({ total: total, personalUnread: personalUnread, groupUnread: groupUnread }); } catch (e) {}
+        try {
+          var chats = [];
+          for (var i = 0; i < rows.length; i++) {
+            var n = String(rows[i].name || '');
+            if (!n || chats.indexOf(n) !== -1) continue;
+            var low = n.toLowerCase();
+            if (['tin nhắn', 'danh bạ', 'zalo cloud', 'công cụ', 'giao việc', 'lịch sử đồng bộ', 'cài đặt'].some(function(k){ return low === k || low.indexOf(k) !== -1; })) continue;
+            chats.push(n);
+          }
+          window.messengerApp.sendRecentChats(chats);
+        } catch (e2) {}
+      }
+
+      function __nyDiagCollect(rows, err) {
+        try {
+          var q = function(sel){ try { return document.querySelectorAll(sel).length; } catch(e){ return -1; } };
+          var probes = {
+            dot_conv_item: q('.conv-item'),
+            star_conv_item: q('[class*="conv-item" i]'),
+            msg_item: q('.msg-item'),
+            data_id: q('[data-id]'),
+            gridv2_conv: q('.gridv2.conv-item'),
+            conv_rel: q('.conv-item.conv-rel')
+          };
+          var samples = [];
+          var sels = ['.conv-item', '.msg-item', '[class*="conv-item"]'];
+          for (var s = 0; s < sels.length; s++) {
+            try {
+              var list = document.querySelectorAll(sels[s]);
+              var got = [];
+              for (var t = 0; t < list.length && got.length < 6; t++) {
+                var el = list[t];
+                got.push(String(el.className || '').slice(0, 120));
+              }
+              samples.push({ sel: sels[s], count: list.length, classes: got });
+            } catch (e) {}
+          }
+          var items = [];
+          for (var i = 0; i < rows.length && items.length < 30; i++) {
+            var r = rows[i];
+            if (!r || !r.el) continue;
+            items.push({ name: r.name, id: r.id, unread: !!r.unread, type: r.type, body: String(r.bodyText||'').slice(0,40) });
+          }
+          window.messengerApp.sendConvDiag({
+            at: Date.now(), engineVer: 'v2', rowCount: rows.length,
+            probes: probes, samples: samples, items: items,
+            err: err ? String(err && err.message ? err.message : err) : null
+          });
         } catch (e) {}
       }
-      setInterval(extractUnreadConversationCount, 3000);
-      setTimeout(extractUnreadConversationCount, 1200);
+
+      function __nyTick() {
+        // DA CHUYEN SANG ISOLATED WORLD (preload top-level). De trong main world = no-op
+        // tranh xung dot display/count voi engine that.
+        return;
+        if (!isZalo) return;
+        var __diagErr = null;
+        try {
+          var rows = __nyCollectConversationRows();
+          __nyApplyFilter(rows);
+          __nyEmitCounts(rows);
+          if (window.__NY_DIAG_ONCE) { window.__NY_DIAG_ONCE = false; __nyDiagCollect(rows, null); }
+        } catch (e) {
+          __diagErr = e;
+          try { if (window.__NY_DIAG_ONCE) { window.__NY_DIAG_ONCE = false; __nyDiagCollect(window.__nyCollectConversationRows ? (function(){try{return __nyCollectConversationRows();}catch(e2){return [];}})() : [], e); } } catch (e3) {}
+        }
+      }
+
+      window.__nyFilterMode = function(mode) {
+        if (mode !== 'personal' && mode !== 'group') mode = 'all';
+        window.__NY_FILTER_MODE = mode;
+        __nyTick();
+      };
+      window.__nyTick = __nyTick;
+
+      setInterval(__nyTick, 2000);
+      setTimeout(__nyTick, 1200);
+
+      // Chan doan tu dong: ghi log vai lan sau khi mo app de bat duoc DOM that (khong can bam chip).
+      var __nyAutoDiag = 0;
+      function __nyAutoDiagFire() {
+        if (__nyAutoDiag >= 4 || !isZalo) return;
+        __nyAutoDiag++;
+        try { __nyDiagCollect(__nyCollectConversationRows(), null); } catch (e) { __nyDiagCollect([], e); }
+      }
+      [3000, 7000, 12000, 20000].forEach(function(d){ setTimeout(__nyAutoDiagFire, d); });
+
+      var __nyObs = null;
+      var __nyObsTimer = null;
+      function __nySetupObserver() {
+        if (__nyObs || !isZalo) return;
+        var rows = document.querySelectorAll('.msg-item, [class*="conv-item" i], [data-id]');
+        if (!rows.length) return;
+        var anchor = rows[0] && rows[0].parentElement;
+        var guard = 0;
+        while (anchor && anchor !== document.body && guard < 6) {
+          if (anchor.querySelectorAll('.msg-item, [class*="conv-item" i], [data-id]').length >= 2) break;
+          anchor = anchor.parentElement; guard++;
+        }
+        if (!anchor || anchor === document.body) anchor = document.body;
+        try {
+          __nyObs = new MutationObserver(function() {
+            if (__nyObsTimer) return;
+            __nyObsTimer = setTimeout(function() { __nyObsTimer = null; __nyTick(); }, 250);
+          });
+          __nyObs.observe(anchor, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'data-unread'] });
+        } catch (e) { __nyObs = null; }
+      }
+      setTimeout(__nySetupObserver, 2500);
+      setInterval(__nySetupObserver, 8000);
 
 
       // Auto extract profile name & avatar
@@ -626,6 +790,213 @@ function runInjection(currentSettings) {
 
 runInjection(settings);
 
+// ===== ENGINE LOC HOI THOAI — chay trong ISOLATED WORLD (preload) =====
+// Ly do: main-world IIFE (injectionScript) bat isZalo MOT LUC luc inject va co the
+// khong chay duoc khi anh bam chip. Isolated world truy cap CUNG DOM that, co san
+// ipcRenderer, va tinh isZalo TUOI moi tick -> chang phu thuoc injection/timing.
+// Chi toggle 'display' tren dong .conv-item — khong click/khong scroll -> KHONG tu danh dau da doc.
+(function () {
+  var __nyMode = 'all';
+
+  function __nyIsZalo() {
+    var h = location.hostname || '';
+    return h === 'chat.zalo.me' || h.indexOf('zalo.me') !== -1;
+  }
+
+  function __nyNorm(value) {
+    return String(value || '')
+      .normalize('NFC')
+      .replace(/[​-‍﻿]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function __nyClassify(input) {
+    var dataId = String((input && input.dataId) || '');
+    var className = String((input && input.className) || '');
+    var ariaLabel = String((input && input.ariaLabel) || '');
+    var title = String((input && input.title) || '');
+    var bodyText = String((input && input.bodyText) || '');
+    var avatarCount = Number((input && input.avatarCount) || 0) || 0;
+    var hasGroupIcon = !!(input && input.hasGroupIcon);
+    // Tin xem truoc cua nhom luon co tien to ten nguoi gui ("Emin:"); chat 1-1 thi khong (hoac "Bạn:").
+    var m = bodyText.match(/^\s*([^:\n]{1,40}):\s/);
+    if (m) {
+      var who = m[1].trim().toLowerCase();
+      if (who && who !== 'bạn' && who !== 'ban' && who !== 'you') return 'group';
+    }
+    if (/(^|[^a-z])(group|grp)[_-]/i.test(dataId)) return 'group';
+    if (/\bgroup\b/i.test(className)) return 'group';
+    if (/(nh[oó]m|group)/i.test(ariaLabel) || /(nh[oó]m|group)/i.test(title)) return 'group';
+    if (avatarCount >= 3) return 'group';
+    if (hasGroupIcon) return 'group';
+    return 'personal';
+  }
+
+  function __nyIsUnread(row) {
+    if (!row || !row.querySelector) return false;
+    var badge = row.querySelector('[class*="unread" i], [class*="badge" i], [class*="notify" i], [data-unread="true"]');
+    if (!badge) return false;
+    var rect = badge.getBoundingClientRect && badge.getBoundingClientRect();
+    var style = window.getComputedStyle ? window.getComputedStyle(badge) : null;
+    if (!rect || rect.width <= 0 || rect.height <= 0 || (style && (style.display === 'none' || style.visibility === 'hidden'))) return false;
+    var text = String(badge.textContent || '').trim();
+    var className = String(badge.className || '');
+    if (!text && !/unread|notify/i.test(className) && badge.getAttribute('data-unread') !== 'true') return false;
+    return true;
+  }
+
+  function __nyCollect() {
+    if (!__nyIsZalo()) return [];
+    var inner = Array.prototype.slice.call(document.querySelectorAll('.conv-item'));
+    var seenEl = [];
+    var seenKey = {};
+    var out = [];
+    inner.forEach(function (cell) {
+      if (!cell || !cell.querySelector) return;
+      var row = (cell.closest && cell.closest('.msg-item')) || cell;
+      if (seenEl.indexOf(row) !== -1) return;
+      seenEl.push(row);
+      var key = row.getAttribute('data-id') || row.getAttribute('id') || '';
+      if (!key) key = 'k:' + out.length;
+      if (seenKey[key]) return;
+      seenKey[key] = true;
+      var nameEl = row.querySelector('.conv-item-title__name, .item-title__name, .item-title, .truncate');
+      var name = nameEl ? __nyNorm(nameEl.innerText || nameEl.textContent || '') : '';
+      var bodyEl = row.querySelector('.conv-item-body, [class*="conv-item-body"]');
+      var bodyText = bodyEl ? __nyNorm(bodyEl.innerText || bodyEl.textContent || '') : '';
+      var unread = __nyIsUnread(row);
+      var typed = __nyClassify({
+        dataId: row.getAttribute('data-id') || '',
+        className: String(row.className || ''),
+        ariaLabel: String(row.getAttribute('aria-label') || ''),
+        title: String(row.getAttribute('title') || name || ''),
+        bodyText: bodyText,
+        avatarCount: row.querySelectorAll('img,.avatar,.zavatar').length,
+        hasGroupIcon: !!row.querySelector('[class*="group" i]')
+      });
+      out.push({ el: row, id: key, name: name, unread: unread, type: typed, bodyText: bodyText });
+    });
+    return out;
+  }
+
+  function __nyApply(rows) {
+    // Deliberately read-only. Never mutate style/class/scroll/focus on Zalo rows.
+    return rows;
+  }
+
+  function __nyEmit(rows) {
+    var personalUnread = 0, groupUnread = 0;
+    rows.forEach(function (r) { if (r && r.unread) { if (r.type === 'group') groupUnread += 1; else personalUnread += 1; } });
+    var total = personalUnread + groupUnread;
+    try { ipcRenderer.send('profile-unread-count', total); } catch (e) {}
+    try { ipcRenderer.send('profile-unread-count-detail', { total: total, personalUnread: personalUnread, groupUnread: groupUnread }); } catch (e) {}
+    try {
+      var chats = [];
+      for (var i = 0; i < rows.length; i++) {
+        var n = String(rows[i].name || '');
+        if (!n || chats.indexOf(n) !== -1) continue;
+        var low = n.toLowerCase();
+        if (['tin nhắn', 'danh bạ', 'zalo cloud', 'công cụ', 'giao việc', 'lịch sử đồng bộ', 'cài đặt'].some(function (k) { return low === k || low.indexOf(k) !== -1; })) continue;
+        chats.push(n);
+      }
+      ipcRenderer.send('recent-chats-extracted', chats);
+    } catch (e2) {}
+  }
+
+  function __nyTick() {
+    if (!__nyIsZalo()) return;
+    try {
+      var rows = __nyCollect();
+      __nyApply(rows);
+      __nyEmit(rows);
+      __nyDiagRows(rows);
+    } catch (e) {
+      try { ipcRenderer.send('conv-diag4', { at: Date.now(), err: String(e && e.message ? e.message : e) }); } catch (e2) {}
+    }
+  }
+
+  // Do chan dong: vai lan dau, gui phan loai + unread cua tung dong de doi chieu.
+  var __nyDiagN = 0;
+  function __nyDiagRows(rows) {
+    if (__nyDiagN >= 18) return;
+    __nyDiagN++;
+    try {
+      var pu = 0, gu = 0, out = [];
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (r.unread) { if (r.type === 'group') gu++; else pu++; }
+        out.push({ name: String(r.name || '').slice(0, 24), unread: !!r.unread, type: r.type, body: String(r.bodyText || '').slice(0, 36) });
+      }
+      // Do cau truc tho: so .conv-item that trong DOM vs so dong engine gom duoc,
+      // de phan biet virtualization (raw it) vs gop nham qua closest('.msg-item') (raw nhieu, rowCount it).
+      var rawCells = document.querySelectorAll('.conv-item');
+      var struct = [];
+      for (var j = 0; j < rawCells.length && j < 10; j++) {
+        var c = rawCells[j];
+        var mi = c.closest ? c.closest('.msg-item') : null;
+        struct.push({
+          cls: String(c.className || '').slice(0, 60),
+          hasMsgItem: !!mi,
+          miCls: mi ? String(mi.className || '').slice(0, 60) : null,
+          dataId: c.getAttribute('data-id') || (mi && mi.getAttribute('data-id')) || '',
+          badge: !!c.querySelector('[class*="unread" i], [class*="badge" i], [class*="notify" i], [data-unread="true"]')
+        });
+      }
+      ipcRenderer.send('conv-diag4', { at: Date.now(), mode: __nyMode, rawConvItem: rawCells.length, rowCount: rows.length, personalUnread: pu, groupUnread: gu, struct: struct, rows: out });
+    } catch (e) {}
+  }
+
+  window.__nyIwSetMode = function (m) {
+    __nyMode = (m === 'personal' || m === 'group') ? m : 'all';
+    __nyTick();
+  };
+
+  setInterval(__nyTick, 1500);
+  setTimeout(__nyTick, 1000);
+
+  var __nyObs = null, __nyObsTimer = null;
+  function __nySetupObserver() {
+    if (__nyObs || !__nyIsZalo()) return;
+    var rows = document.querySelectorAll('.conv-item');
+    if (!rows.length) return;
+    var anchor = rows[0] && rows[0].parentElement;
+    var guard = 0;
+    while (anchor && anchor !== document.body && guard < 6) {
+      if (anchor.querySelectorAll('.conv-item').length >= 2) break;
+      anchor = anchor.parentElement; guard++;
+    }
+    if (!anchor || anchor === document.body) anchor = document.body;
+    try {
+      __nyObs = new MutationObserver(function () {
+        if (__nyObsTimer) return;
+        __nyObsTimer = setTimeout(function () { __nyObsTimer = null; __nyTick(); }, 250);
+      });
+      __nyObs.observe(anchor, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-unread'] });
+    } catch (e) { __nyObs = null; }
+  }
+  setTimeout(__nySetupObserver, 2500);
+  setInterval(__nySetupObserver, 8000);
+})();
+
+// ===== di chan dong (giu lai tam thoi de doi chieu, se go khi xong) =====
+(function () {
+  var __nyDiag3N = 0;
+  function __nyDiag3Fire() {
+    if (__nyDiag3N >= 5) return;
+    __nyDiag3N++;
+    try {
+      var q = function (sel) { try { return document.querySelectorAll(sel).length; } catch (e) { return -1; } };
+      var probes = { dot_conv_item: q('.conv-item'), star_conv_item: q('[class*="conv-item" i]'), msg_item: q('.msg-item'), data_id: q('[data-id]'), conv_rel: q('.conv-item.conv-rel') };
+      var samples = [];
+      var list = document.querySelectorAll('.conv-item');
+      for (var t = 0; t < list.length && t < 5; t++) samples.push(String(list[t].className || '').slice(0, 120));
+      ipcRenderer.send('conv-diag3', { at: Date.now(), host: location.hostname, ready: document.readyState, probes: probes, samples: samples });
+    } catch (e) { try { ipcRenderer.send('conv-diag3', { at: Date.now(), err: String(e) }); } catch (e2) {} }
+  }
+  [2000, 6000, 11000, 18000, 28000].forEach(function (d) { setTimeout(__nyDiag3Fire, d); });
+})();
+
 ipcRenderer.on('zalo-group-scan:start', (event, { scanId, script }) => {
   webFrame.executeJavaScript(script).catch((error) => {
     ipcRenderer.send('zalo-group-scan:event', { scanId, type: 'error', message: error.message || String(error) });
@@ -656,6 +1027,11 @@ ipcRenderer.on('update-quick-replies', (event, replies) => {
     window.__DepLaoQuickReplies = ${JSON.stringify(replies)};
     console.log('[DepLao] Cập nhật tin nhắn mẫu:', window.__DepLaoQuickReplies.length, 'mẫu');
   `);
+});
+
+ipcRenderer.on('conversation-filter:set', (event, payload) => {
+  const mode = (payload && payload.mode) || 'all';
+  try { window.__nyIwSetMode(mode); } catch (e) {}
 });
 
 ipcRenderer.on('quick-reply:ensure-ready', (event, payload) => {

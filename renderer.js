@@ -1,4 +1,16 @@
 const { ipcRenderer, shell, clipboard } = require('electron');
+async function copyTextSafely(text, statusElement, successText) {
+  try {
+    const result = await ipcRenderer.invoke('app:copy-text', String(text || ''));
+    if (!result?.ok) throw new Error('Copy failed');
+    statusElement.innerText = successText;
+    return true;
+  } catch {
+    statusElement.innerText = 'Kh\u00f4ng sao ch\u00e9p \u0111\u01b0\u1ee3c';
+    return false;
+  }
+}
+// Clipboard helper end
 const { buildBulkGroupPlan, filterAndSortGroups, findAmbiguousGroupNames, getLeavePolicyWaitMs, LEAVE_GROUP_POLICY } = require('./modules/zalo-group-scan');
 const { filterAndSortUsers } = require('./modules/zalo-user-management');
 const {
@@ -75,6 +87,7 @@ let workspaceState = ipcRenderer.sendSync('workspace-get-state') || { currentId:
 let workspaceData = normalizeWorkspaceData(workspaceState.data);
 let profiles = normalizeProfiles(workspaceData.profiles);
 let activeProfileId = profiles[0]?.id || null;
+let conversationFilterMode = 'all';
 let downloads = [];
 const profileConnectionStates = new Map();
 let updateState = { status: 'idle', progress: 0, message: '' };
@@ -127,6 +140,7 @@ let pancakeProducts = [];
 let pancakeProductCache = null;
 let pancakeItems = [];
 let currentPancakeLink = null;
+let pancakeDetailGeneration = 0;
 // Nut Tạo đơn tren topbar: popup ket qua co the o che do loi (mau do, khong cho sao chep)
 // va co the kem nut Huy de don don thu 0d tao tu dong.
 let pancakePopupMode = 'success';
@@ -174,6 +188,7 @@ function normalizeProfiles(list) {
 
     const platform = p.platform || 'zalo';
     let partition = p.partition || createProfilePartition(id, platform);
+    if (!String(partition).startsWith('persist:')) partition = `persist:${partition}`;
     if (usedPartitions.has(partition)) {
       partition = createProfilePartition(`${id}_${Math.random().toString(36).slice(2, 8)}`, platform);
     }
@@ -185,7 +200,9 @@ function normalizeProfiles(list) {
 function persistWorkspace() {
   workspaceData.profiles = profiles;
   workspaceData = normalizeWorkspaceData(workspaceData);
-  workspaceState = ipcRenderer.sendSync('workspace-save-data', workspaceData);
+  const savedState = ipcRenderer.sendSync('workspace-save-data', workspaceData);
+  if (!savedState || savedState.ok === false) throw new Error(savedState?.message || 'Workspace save failed.');
+  workspaceState = savedState;
   workspaceData = normalizeWorkspaceData(workspaceState.data);
   profiles = normalizeProfiles(workspaceData.profiles);
   if (!profiles.some((p) => p.id === activeProfileId)) activeProfileId = profiles[0]?.id || null;
@@ -551,7 +568,7 @@ async function setUtilityTab(tab) {
   }
   // orders tab: Don Pancake chi can Pancake API, khong can CRM; design tab van can CRM
   if (tab === 'orders') void Promise.allSettled([refreshPancakeCurrent(), loadPancakeWarehouses(), loadPancakeOrders()]);
-  if (crmConnected && tab === 'design') void Promise.allSettled([resolveCrmConversation({ quiet: true }), loadDesigners(), loadDesignOrders()]);
+  if (crmConnected && tab === 'design') void Promise.allSettled([loadDesigners(), loadDesignOrders()]);
 }
 
 function setUtilityPanelOpen(open, tab = currentUtilityTab) {
@@ -617,22 +634,10 @@ function renderCrmConnection() {
   const toggle = document.getElementById('crm-connection-toggle');
   document.getElementById('crm-login-form').hidden = crmConnected;
   document.getElementById('crm-connected').hidden = !crmConnected;
-  // Don Pancake khong phu thuoc CRM nen an badge CRM khi o tab orders
-  toggle.hidden = !crmConnected || currentUtilityTab === 'quote' || currentUtilityTab === 'orders';
+  toggle.hidden = !crmConnected || currentUtilityTab !== 'design';
   toggle.setAttribute('aria-expanded', String(!box.hidden));
   if (crmConnected) box.hidden = true;
-  else box.hidden = currentUtilityTab === 'quote' || currentUtilityTab === 'orders';
-  if (!crmConnected) return;
-  const select = document.getElementById('crm-account-select');
-  const current = workspaceData.crmAccountMappings[activeProfileId] || '';
-  select.innerHTML = '<option value="">Chọn nick CRM</option>' + crmAccounts.map((account) => `<option value="${escapeHtml(account.id)}">${escapeHtml(account.displayName || account.phone || account.id)}</option>`).join('');
-  let next = current;
-  if (!next) {
-    const activeName = String(getActiveProfile()?.zaloDisplayName || getActiveProfile()?.name || '').trim().toLocaleLowerCase('vi-VN');
-    const matches = crmAccounts.filter((account) => String(account.displayName || '').trim().toLocaleLowerCase('vi-VN') === activeName);
-    if (matches.length === 1) next = matches[0].id;
-  }
-  select.value = next;
+  else box.hidden = currentUtilityTab !== 'design';
 }
 
 function conversationRows(data) {
@@ -810,7 +815,6 @@ function pancakeOrderPayload() {
   const phone = document.getElementById('pancake-phone').value.trim();
   const address = document.getElementById('pancake-address').value.trim();
   if (!warehouseId) throw new Error('Hãy chọn kho Pancake.');
-  if (!pancakeItems.length) throw new Error('Hãy chọn ít nhất một sản phẩm.');
   return {
     warehouse_id: warehouseId, bill_full_name: name, bill_phone_number: phone,
     shipping_address: { address, full_address: address, full_name: name, phone_number: phone },
@@ -854,7 +858,9 @@ function normalizePancakeOrder(raw = {}) {
 }
 
 async function loadPancakeOrderDetail(orderCode) {
+  const generation = ++pancakeDetailGeneration;
   const data = await pancakeRequest(`/shops/609730/orders/${encodeURIComponent(orderCode)}`);
+  if (generation !== pancakeDetailGeneration) return;
   const order = normalizePancakeOrder(data.order || data.data || data);
   currentPancakeLink = { orderCode: order.orderCode || orderCode, pancakeOrderId: order.pancakeOrderId || orderCode, syncStatus: order.statusName || 'Đã tải' };
   applyPancakeOrder(order);
@@ -882,6 +888,43 @@ async function loadPancakeOrders({ autoSelectCode = '' } = {}) {
   } catch (error) { list.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`; }
 }
 
+function formatDesignActivityValue(value) {
+  const statuses = { demo: 'Chưa demo', designing: 'Đang thiết kế', approved: 'Chốt in', cancelled: 'Khách huỷ' };
+  if (value === true || value === 'true') return 'Bật';
+  if (value === false || value === 'false') return 'Tắt';
+  return statuses[value] || String(value ?? '—');
+}
+
+function renderDesignActivity(activities = []) {
+  const box = document.getElementById('design-activity');
+  const count = document.getElementById('design-activity-count');
+  if (!box || !count) return;
+  const rows = (Array.isArray(activities) ? [...activities] : []).sort((a, b) => new Date(b.changedAt || b.createdAt || 0) - new Date(a.changedAt || a.createdAt || 0));
+  count.innerText = `${rows.length} lần cập nhật`;
+  if (!rows.length) {
+    box.innerHTML = '<div class="design-activity-empty">Chưa có hoạt động</div>';
+    return;
+  }
+  const labels = {
+    created: 'Tạo đơn thiết kế', status: 'Chuyển trạng thái', file_count: 'Thay đổi số mẫu thiết kế',
+    designer: 'Thay đổi Designer', designer_id: 'Thay đổi Designer', deadline: 'Thay đổi deadline', notes: 'Thay đổi ghi chú',
+    is_urgent: 'Thay đổi đơn hàng GẤP', isUrgent: 'Thay đổi đơn hàng GẤP',
+    has_design_fee: 'Thay đổi phí thiết kế', hasDesignFee: 'Thay đổi phí thiết kế',
+    is_outsource: 'Thay đổi Outsource', isOutsource: 'Thay đổi Outsource',
+  };
+  box.innerHTML = rows.map((activity) => {
+    const type = activity.type || (activity.status ? 'status' : 'updated');
+    const label = labels[type] || 'Cập nhật đơn thiết kế';
+    const oldValue = activity.oldValue;
+    const newValue = activity.newValue ?? activity.status;
+    const value = oldValue == null ? formatDesignActivityValue(newValue) : `${formatDesignActivityValue(oldValue)} → ${formatDesignActivityValue(newValue)}`;
+    const actor = activity.changedBy?.fullName || activity.user?.fullName || 'Hệ thống';
+    const timestamp = activity.changedAt || activity.createdAt;
+    const time = timestamp ? new Date(timestamp).toLocaleString('vi-VN', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit', year: 'numeric' }) : '';
+    return `<article class="design-activity-item"><span class="design-activity-icon" aria-hidden="true">↔</span><span class="design-activity-copy"><strong>${escapeHtml(label)}${value && value !== '—' ? `: ${escapeHtml(value)}` : ''}</strong><small>${escapeHtml(actor)}</small></span><time class="design-activity-time" datetime="${escapeHtml(timestamp || '')}">${escapeHtml(time)}</time></article>`;
+  }).join('');
+}
+
 function fillDesignForm(order = null) {
   selectedDesignOrder = order;
   document.getElementById('design-list-view').hidden = true;
@@ -893,6 +936,10 @@ function fillDesignForm(order = null) {
   document.getElementById('design-deadline').value = order?.deadline ? String(order.deadline).slice(0, 10) : '';
   document.getElementById('design-designer').value = order?.designerId || order?.designer?.id || '';
   document.getElementById('design-note').value = order?.notes || '';
+  document.getElementById('design-urgent').checked = !!order?.isUrgent;
+  document.getElementById('design-fee').checked = !!order?.hasDesignFee;
+  document.getElementById('design-outsource').checked = !!order?.isOutsource;
+  renderDesignActivity(order?.activities || order?.statusHistory || []);
   document.getElementById('design-save').innerText = order ? 'Cập nhật đơn thiết kế' : 'Tạo đơn thiết kế';
 }
 
@@ -1389,6 +1436,23 @@ function renderSidebar() {
     profilesList.appendChild(btn);
   });
 }
+function setConversationFilter(mode){
+  if(mode!=='all'&&mode!=='personal'&&mode!=='group') mode='all';
+  conversationFilterMode=mode;
+  const map={all:'filter-all',personal:'filter-personal',group:'filter-group'};
+  Object.entries(map).forEach(([m,id])=>{ const el=document.getElementById(id); if(el) el.classList.toggle('active',m===mode); });
+  if(activeProfileId) ipcRenderer.send('conversation-filter:set',{profileId:activeProfileId,mode});
+}
+function bindConversationFilterChips(){
+  const map={all:'filter-all',personal:'filter-personal',group:'filter-group'};
+  Object.entries(map).forEach(([m,id])=>{ const b=document.getElementById(id); if(b) b.onclick=()=>setConversationFilter(m); });
+}
+function updateConversationFilterVisibility(){
+  const el=document.getElementById('topbar-filter'); if(!el) return;
+  // Disabled until filtering can use a supported Zalo API. DOM hiding corrupts the
+  // virtualized conversation list and can make existing history appear missing.
+  el.hidden = true;
+}
 function switchProfile(id) {
   activeProfileId = id;
   crmConversation = null;
@@ -1401,6 +1465,9 @@ function switchProfile(id) {
   document.getElementById('send-video-topbar')?.classList.remove('active');
   releasePopupDock();
   renderSidebar();
+  setConversationFilter('all');
+  updateConversationFilterVisibility();
+  ['filter-personal-count','filter-group-count'].forEach((cid)=>{ const e=document.getElementById(cid); if(e){ e.textContent=''; e.style.display='none'; }});
   const profile = getActiveProfile();
   if (profile) {
     ipcRenderer.send('switch-profile', profile);
@@ -1423,6 +1490,8 @@ function openModal(profileToEdit = null) {
   customUrlInput.style.display = (profileToEdit?.platform === 'custom') ? 'block' : 'none';
   document.getElementById('modal-delete').style.display = profileToEdit ? 'inline-flex' : 'none';
   document.getElementById('modal-clear-cache').style.display = profileToEdit ? 'inline-flex' : 'none';
+  document.getElementById('modal-repair-cache').style.display = profileToEdit ? 'inline-flex' : 'none';
+  document.getElementById('modal-export-diagnostics').style.display = profileToEdit ? 'inline-flex' : 'none';
   updateAvatarPreview();
   openOverlay('modal-overlay');
   nameInput.focus();
@@ -1483,6 +1552,8 @@ function renderWorkspaces() {
     btn.onclick = () => {
       const id = btn.getAttribute('data-workspace');
       if (id === workspaceState.currentId) return;
+      pancakeDetailGeneration++;
+      currentPancakeLink = null;
       workspaceState = ipcRenderer.sendSync('workspace-switch', id);
       workspaceData = normalizeWorkspaceData(workspaceState.data);
       profiles = normalizeProfiles(workspaceData.profiles);
@@ -2114,8 +2185,8 @@ function renderUpdate() {
 }
 
 function fillAISettings() {
-  document.getElementById('ai-endpoint').value = workspaceData.aiSettings.endpoint || localStorage.getItem('AI_ENDPOINT') || '';
-  document.getElementById('ai-api-key').value = workspaceData.aiSettings.apiKey || localStorage.getItem('AI_API_KEY') || '';
+  document.getElementById('ai-endpoint').value = workspaceData.aiSettings.endpoint || '';
+  document.getElementById('ai-api-key').value = workspaceData.aiSettings.apiKey || '';
   document.getElementById('ai-model').value = workspaceData.aiSettings.model || 'gpt-4o-mini';
 }
 function saveAISettings() {
@@ -2124,9 +2195,9 @@ function saveAISettings() {
     apiKey: document.getElementById('ai-api-key').value.trim(),
     model: document.getElementById('ai-model').value.trim() || 'gpt-4o-mini',
   };
-  localStorage.setItem('AI_ENDPOINT', workspaceData.aiSettings.endpoint);
-  localStorage.setItem('AI_API_KEY', workspaceData.aiSettings.apiKey);
   persistWorkspace();
+  localStorage.removeItem('AI_ENDPOINT');
+  localStorage.removeItem('AI_API_KEY');
   trackEvent('ai_settings_saved', { endpoint: workspaceData.aiSettings.endpoint });
   document.getElementById('ai-status').innerText = 'Đã lưu cấu hình';
 }
@@ -2200,10 +2271,46 @@ document.getElementById('modal-clear-cache').onclick = async () => {
   try {
     btn.textContent = 'Đang dọn...';
     btn.disabled = true;
-    const result = await ipcRenderer.invoke('profile-clear-cache', editingProfile.id);
+    const result = await ipcRenderer.invoke('profile-clear-cache-light', editingProfile.id);
     if (!result || !result.ok) return alert(result?.message || 'Không dọn được cache. Thử đóng rồi mở lại Zalo.');
-    alert('Đã dọn cache cho tài khoản này (giữ đăng nhập). Trang sẽ tự tải lại.');
+    alert('Đã dọn HTTP/code cache, không đụng dữ liệu Zalo. Trang sẽ tự tải lại.');
     closeOverlay('modal-overlay');
+  } catch (e) {
+    alert(e.message || String(e));
+  } finally {
+    btn.textContent = prev;
+    btn.disabled = false;
+  }
+};
+document.getElementById('modal-repair-cache').onclick = async () => {
+  if (!editingProfile) return;
+  if (!confirm('Sửa cache sâu sẽ sao lưu dữ liệu quan trọng rồi làm mới Service Worker/CacheStorage. Chỉ dùng khi Zalo lỗi kéo dài. Tiếp tục?')) return;
+  const btn = document.getElementById('modal-repair-cache');
+  const prev = btn.textContent;
+  try {
+    btn.textContent = 'Đang sao lưu...';
+    btn.disabled = true;
+    const result = await ipcRenderer.invoke('profile-repair-cache-deep', editingProfile.id);
+    if (!result?.ok) return alert(result?.message || 'Không sửa được cache sâu.');
+    alert(`Đã sửa cache sâu và giữ dữ liệu đăng nhập.${result.backupPath ? `\nBản sao lưu: ${result.backupPath}` : ''}`);
+    closeOverlay('modal-overlay');
+  } catch (e) {
+    alert(e.message || String(e));
+  } finally {
+    btn.textContent = prev;
+    btn.disabled = false;
+  }
+};
+document.getElementById('modal-export-diagnostics').onclick = async () => {
+  const btn = document.getElementById('modal-export-diagnostics');
+  const prev = btn.textContent;
+  try {
+    btn.textContent = 'Đang xuất...';
+    btn.disabled = true;
+    const result = await ipcRenderer.invoke('diagnostics-export');
+    if (result?.canceled) return;
+    if (!result?.ok) return alert(result?.message || 'Không xuất được chẩn đoán.');
+    alert(`Đã xuất ${result.eventCount} sự kiện trong 10 phút gần nhất:\n${result.filePath}`);
   } catch (e) {
     alert(e.message || String(e));
   } finally {
@@ -2774,19 +2881,22 @@ ipcRenderer.on('lock-state', (_, state) => {
   hasLockPassword = !!state.hasPassword;
   document.getElementById('btn-shield').classList.toggle('active', !!state.zadarkShield);
   if (state.locked) showLockOverlay(!hasLockPassword);
+  updateConversationFilterVisibility();
 });
 ipcRenderer.on('need-master-password', () => {
   showSecureOverlay();
 });
 ipcRenderer.on('store-unlocked', () => {
   hideSecureOverlay();
+  updateConversationFilterVisibility();
 });
-ipcRenderer.on('unlock-result', (_, result) => { 
-  if (result.ok) { 
+ipcRenderer.on('unlock-result', (_, result) => {
+  if (result.ok) {
     if (result.removed) { hasLockPassword = false; alert('Đã gỡ mật khẩu khóa ứng dụng thành công!'); }
-    else hasLockPassword = true; 
-    hideLockOverlay(); 
-  } else alert(result.message || 'Sai mật khẩu.'); 
+    else hasLockPassword = true;
+    hideLockOverlay();
+    updateConversationFilterVisibility();
+  } else alert(result.message || 'Sai mật khẩu.');
 });
 ipcRenderer.on('zalo-group-scan:update', (_, update) => {
   if (activeZaloGroupScan?.scanId && update.scanId !== activeZaloGroupScan.scanId) return;
@@ -2800,6 +2910,12 @@ ipcRenderer.on('zalo-group-scan:update', (_, update) => {
   if (update.status === 'completed') loadCompletedZaloGroups();
 });
 
+ipcRenderer.on('update-profile-badge-detail', (_, payload) => {
+  if(!payload || payload.id !== activeProfileId) return;
+  const setCount=(elId,n)=>{ const el=document.getElementById(elId); if(!el) return; const v=Math.max(0,Math.trunc(Number(n)||0)); el.textContent=v>0?'('+v+')':''; el.style.display=v>0?'inline':'none'; };
+  setCount('filter-personal-count', payload.personalUnread);
+  setCount('filter-group-count', payload.groupUnread);
+});
 ipcRenderer.on('update-profile-badge', (_, { id, count }) => {
   const badge = document.getElementById(`badge-${id}`);
   if (badge) {
@@ -2898,30 +3014,31 @@ document.getElementById('crm-connection-toggle').onclick = () => {
   box.hidden = !box.hidden;
   document.getElementById('crm-connection-toggle').setAttribute('aria-expanded', String(!box.hidden));
 };
-document.getElementById('crm-base-url').value = localStorage.getItem('nha-yen-crm-url') || 'https://nhayencrm.com';
+document.getElementById('crm-base-url').value = localStorage.getItem('nha-yen-pos-url') || 'https://nhayenpos.web.app';
 document.getElementById('crm-login').onclick = async () => {
   const status = document.getElementById('crm-status');
-  status.innerText = 'Đang kết nối CRM…';
+  status.innerText = '\u0110ang k\u1ebft n\u1ed1i Nh\u00e0 Y\u1ebfn POS\u2026';
   const result = await ipcRenderer.invoke('crm:login', {
     baseUrl: document.getElementById('crm-base-url').value,
     identifier: document.getElementById('crm-identifier').value,
     password: document.getElementById('crm-password').value,
   });
-  if (!result?.ok) { status.innerText = result?.message || 'Không kết nối được CRM.'; return; }
-  crmConnected = true; crmAccounts = result.accounts || [];
-  localStorage.setItem('nha-yen-crm-url', result.baseUrl);
+  if (!result?.ok) { status.innerText = result?.message || 'Kh\u00f4ng k\u1ebft n\u1ed1i \u0111\u01b0\u1ee3c Nh\u00e0 Y\u1ebfn POS.'; return; }
+  crmConnected = true;
+  localStorage.setItem('nha-yen-pos-url', result.baseUrl);
   const crmUserName = document.getElementById('crm-user-name');
-  if (crmUserName) crmUserName.innerText = result.user?.fullName || result.user?.email || 'Đã kết nối CRM';
+  if (crmUserName) crmUserName.innerText = result.user?.fullName || result.user?.email || '\u0110\u00e3 k\u1ebft n\u1ed1i Nh\u00e0 Y\u1ebfn POS';
   document.getElementById('crm-password').value = '';
-  status.innerText = 'Kết nối CRM thành công.';
+  status.innerText = 'K\u1ebft n\u1ed1i Nh\u00e0 Y\u1ebfn POS th\u00e0nh c\u00f4ng.';
   renderCrmConnection();
-  await Promise.allSettled([resolveCrmConversation({ quiet: true }), loadDesigners(), loadDesignOrders(), loadPancakeWarehouses(), loadPancakeOrders(), syncQuickRepliesFromCrm()]);
+  await Promise.allSettled([loadDesigners(), loadDesignOrders()]);
 };
-document.getElementById('crm-logout').onclick = async () => { await ipcRenderer.invoke('crm:logout'); crmConnected = false; crmAccounts = []; crmConversation = null; renderCrmConnection(); renderUtilityContext(); };
-document.getElementById('crm-account-select').onchange = async (event) => {
-  workspaceData.crmAccountMappings[activeProfileId] = event.target.value;
-  persistWorkspace(); crmConversation = null;
-  await Promise.allSettled([resolveCrmConversation({ quiet: true }), loadDesignOrders(), loadPancakeOrders()]);
+document.getElementById('crm-logout').onclick = async () => {
+  await ipcRenderer.invoke('crm:logout');
+  crmConnected = false;
+  selectedDesignOrder = null;
+  renderCrmConnection();
+  renderUtilityContext();
 };
 const mappingSaveButton = document.getElementById('mapping-save');
 if (mappingSaveButton) mappingSaveButton.onclick = async () => {
@@ -2990,59 +3107,54 @@ function showPancakeCreatePopup(mode, text, { cancelCode = '' } = {}) {
     popup.style.right = 'auto';
   }
 }
-// Nút "Tạo đơn" trên topbar: anh chi can lay ma don nen moi thu tu dong — kho tu chon
-// (uu tien kho cho tao don), chua co san pham thi them dong tam 0d de Pancake van cap ma.
+// Nút "Tạo đơn" trên topbar: anh chi can lay ma don nen moi thu tu dong — kho tu chon.
+// Pancake nhan danh sach items rong, khong tu gan san pham dau tien trong catalog.
 // Luon hien popup ket qua (ma don de sao chep, hoac loi) thay vi im lang.
 document.getElementById('pancake-topbar-create').onclick = async () => {
   const button = document.getElementById('pancake-topbar-create');
   try {
     button.disabled = true;
     button.innerText = 'Đang tạo…';
-    if (!pancakeWarehouses.length) await loadPancakeWarehouses();
+    if (!pancakeWarehouses.length) {
+      try {
+        await loadPancakeWarehouses();
+      } catch (warehouseError) {
+        const reason = warehouseError?.message || String(warehouseError || '');
+        throw new Error(`Chưa có thông tin kho hàng: ${reason}. Hãy mở tab Pancake để tải lại danh sách kho.`);
+      }
+    }
     const select = document.getElementById('pancake-warehouse');
     if (!select.value) {
       const preferred = pancakeWarehouses.find((warehouse) => warehouse.allow_create_order) || pancakeWarehouses[0];
       if (preferred) select.value = preferred.id;
     }
-    let testOrderCode = '';
-    if (!pancakeItems.length) {
-      button.innerText = 'Đang tạo đơn tạm 0đ…';
-      let catalog = [];
-      try { catalog = await loadPancakeProductCatalog(); } catch { /* fallback duoi se lo */ }
-      const first = catalog[0];
-      if (first) {
-        pancakeItems = [{
-          variation_id: first.id, product_id: first.product_id || first.product?.id,
-          name: 'Đơn tạm 0đ (tự tạo để lấy mã)', detail: '', price: 0, quantity: 1,
-        }];
-      } else {
-        throw new Error('Chưa có sản phẩm trong Pancake và cũng không có sẵn dòng nào để tạo đơn tạm.');
-      }
-      testOrderCode = 'auto';
-    }
+    if (!pancakeWarehouses.length) throw new Error('Chưa có thông tin kho hàng. Hãy mở tab Pancake để tải lại danh sách kho.');
+    const emptyOrder = pancakeItems.length === 0;
+    if (emptyOrder) button.innerText = 'Đang tạo đơn trống 0đ…';
     const payload = pancakeApiPayload(pancakeOrderPayload());
     const result = await pancakeRequest('/shops/609730/orders', 'POST', payload);
     const order = result.data || result.order || result;
     const code = String(order.orderCode || order.display_id || order.id || '');
     document.getElementById('crm-status').innerText = `Đã tạo đơn ${code}`;
-    showPancakeCreatePopup('success', code, { cancelCode: testOrderCode ? code : '' });
-    // Chi reload don vua tao khi la don anh nhap tay; don tam 0d khong ghi de form dang nhap.
-    if (!testOrderCode) {
+    showPancakeCreatePopup('success', code, { cancelCode: emptyOrder ? code : '' });
+    // Chi reload don vua tao khi co san pham; don trong 0d khong ghi de form dang nhap.
+    if (!emptyOrder) {
       await loadPancakeOrderDetail(code).catch(() => {});
       await loadPancakeOrders().catch(() => {});
     }
   } catch (error) {
-    showPancakeCreatePopup('error', error.message || 'Không tạo được đơn.');
+    const message = error?.message || 'Không tạo được đơn.';
+    document.getElementById('crm-status').innerText = message;
+    showPancakeCreatePopup('error', message);
   }
   finally { button.disabled = false; button.innerText = 'Tạo đơn'; }
 };
 // Popup "Da tao ma don": nut sao chep ma don vao clipboard
-document.getElementById('pancake-created-copy').onclick = () => {
+document.getElementById('pancake-created-copy').onclick = async () => {
   if (pancakePopupMode === 'error') return;
   const code = document.getElementById('pancake-created-code').innerText;
-  clipboard.writeText(code);
   const btn = document.getElementById('pancake-created-copy');
-  btn.innerText = 'Đã copy!';
+  if (!await copyTextSafely(code, btn, 'Đã copy!')) return;
   setTimeout(() => { btn.innerText = 'Sao chép'; }, 1200);
 };
 // Popup: nut Huy chi xuat hien cho don thu 0d — chuyen don sang trang thai "canceled"
@@ -3109,16 +3221,14 @@ document.getElementById('design-save').onclick = async () => {
       deadline: document.getElementById('design-deadline').value || null,
       designerId: document.getElementById('design-designer').value || null,
       notes: document.getElementById('design-note').value.trim(),
+      isUrgent: document.getElementById('design-urgent').checked,
+      hasDesignFee: document.getElementById('design-fee').checked,
+      isOutsource: document.getElementById('design-outsource').checked,
     };
     if (!payload.orderCode) throw new Error('Hãy nhập mã đơn thiết kế.');
-    // Cập nhật đơn có sẵn hoàn toàn độc lập với trạng thái kết nối Zalo.
-    // Khi tạo mới, ánh xạ hội thoại là dữ liệu bổ sung; mất kết nối không được chặn tạo đơn.
-    if (!selectedDesignOrder) {
-      const conversation = crmConversation || await resolveCrmConversation({ quiet: true }).catch(() => null);
-      if (conversation?.id) payload.conversationId = conversation.id;
-    }
+    // Nha Yen POS owns design orders directly; the chat code is only used to prefill/search.
     await crmRequest(selectedDesignOrder ? `/orders/${encodeURIComponent(selectedDesignOrder.id)}` : '/orders', selectedDesignOrder ? 'PUT' : 'POST', payload);
-    message.innerText = selectedDesignOrder ? 'Đã cập nhật đơn thiết kế.' : (payload.conversationId ? 'Đã tạo và liên kết đơn thiết kế.' : 'Đã tạo đơn; hội thoại chưa được liên kết.');
+    message.innerText = selectedDesignOrder ? 'Đã cập nhật đơn thiết kế.' : 'Đã tạo đơn thiết kế trên Nhà Yến POS.';
     showDesignListView(); await loadDesignOrders();
   } catch (error) { message.innerText = error.message; }
   finally { button.disabled = false; }
@@ -3128,6 +3238,9 @@ document.getElementById('utility-panel-hide').onclick = () => setUtilityPanelOpe
 document.getElementById('quote-panel-toggle').onclick = () => toggleUtilityPanel('quote');
 document.getElementById('design-orders-topbar').onclick = () => toggleUtilityPanel('design');
 document.getElementById('pancake-orders-topbar').onclick = () => toggleUtilityPanel('orders');
+// Bo loc hoi thoai: gan click that cho 3 chip (Tat ca / Ca nhan / Nhom).
+bindConversationFilterChips();
+updateConversationFilterVisibility();
 document.getElementById('quick-replies-topbar').onclick = () => {
   setUtilityPanelOpen(false);
   renderQuickReplies();

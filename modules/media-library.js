@@ -30,6 +30,52 @@ function ensureMediaStore(mediaRoot) {
   return layout;
 }
 
+function seedDefaultVideos(layout, sourceDir, { now = Date.now } = {}) {
+  const manifestPath = path.join(String(sourceDir || ''), 'default-videos.json');
+  if (!fs.existsSync(manifestPath)) return { added: [], skipped: [], rejected: [] };
+  let manifest;
+  try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); }
+  catch { return { added: [], skipped: [], rejected: [{ id: '', reason: 'manifest-invalid' }] }; }
+  if (!Array.isArray(manifest)) return { added: [], skipped: [], rejected: [{ id: '', reason: 'manifest-invalid' }] };
+  ensureMediaStore(layout.root);
+  const historyPath = path.join(layout.root, 'default-video-seed.json');
+  let seededIds = new Set();
+  try {
+    const history = JSON.parse(fs.readFileSync(historyPath, 'utf8'));
+    seededIds = new Set(Array.isArray(history.seededIds) ? history.seededIds.map(String) : []);
+  } catch {}
+  const rows = readVideoLibraryRows(layout);
+  const added = [], skipped = [], rejected = [];
+  for (const entry of manifest) {
+    const defaultId = String(entry?.id || '').trim();
+    const fileName = path.basename(String(entry?.fileName || ''));
+    if (!defaultId || !fileName || fileName !== String(entry?.fileName || '') || seededIds.has(defaultId)) {
+      if (defaultId) skipped.push(defaultId); else rejected.push({ id: defaultId, reason: 'invalid-entry' });
+      continue;
+    }
+    const sourcePath = path.join(sourceDir, fileName);
+    const plan = planVideoAddition(sourcePath, rows);
+    if (!plan.ok) { rejected.push({ id: defaultId, reason: plan.reason }); continue; }
+    const hash = hashVideoFile(sourcePath);
+    if (findDuplicateByHash(rows, hash)) { seededIds.add(defaultId); skipped.push(defaultId); continue; }
+    const targetName = uniqueVideoFileName(layout.videosDir, fileName);
+    const targetPath = path.join(layout.videosDir, targetName);
+    try {
+      fs.copyFileSync(sourcePath, targetPath, fs.constants.COPYFILE_EXCL);
+      const row = { id: `default-${defaultId}`, defaultId, source: 'default', name: String(entry.name || path.basename(fileName, path.extname(fileName))).trim() || fileName, fileName: targetName, hash, size: plan.size, createdAt: now() };
+      rows.push(row); added.push(row); seededIds.add(defaultId);
+    } catch {
+      try { if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath); } catch {}
+      rejected.push({ id: defaultId, reason: 'copy-failed' });
+    }
+  }
+  if (added.length) writeVideoLibraryRows(layout, rows);
+  const historyTemp = `${historyPath}.tmp`;
+  fs.writeFileSync(historyTemp, JSON.stringify({ seededIds: Array.from(seededIds).sort() }, null, 2), 'utf8');
+  fs.renameSync(historyTemp, historyPath);
+  return { added, skipped, rejected };
+}
+
 function isSupportedVideoExtension(filePath) {
   return SUPPORTED_VIDEO_EXTENSIONS.includes(path.extname(String(filePath || '')).toLowerCase());
 }
@@ -68,6 +114,9 @@ function planVideoAddition(sourcePath, rows, { maxBytes = MAX_LIBRARY_VIDEO_BYTE
     size = statSync(sourcePath).size;
   } catch {
     return { ok: false, name, reason: 'missing', message: 'Không đọc được tệp video.' };
+  }
+  if (!Number.isFinite(size) || size <= 0) {
+    return { ok: false, name, reason: 'empty', message: 'Video rỗng hoặc không hợp lệ.' };
   }
   if (size > maxBytes) {
     const limitMb = Math.round(maxBytes / (1024 * 1024));
@@ -149,6 +198,7 @@ module.exports = {
   SUPPORTED_VIDEO_EXTENSIONS,
   mediaStoreLayout,
   ensureMediaStore,
+  seedDefaultVideos,
   isSupportedVideoExtension,
   hashVideoFile,
   findDuplicateByHash,

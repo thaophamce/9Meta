@@ -7,7 +7,7 @@
 const {
   app,
   BrowserWindow,
-  BrowserView,
+  WebContentsView,
   shell,
   session,
   Menu,
@@ -20,6 +20,7 @@ const {
   dialog,
   desktopCapturer,
   clipboard,
+  ClipboardItem,
   safeStorage,
 } = require('electron');
 const { autoUpdater } = require('electron-updater');
@@ -27,6 +28,13 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
+const IS_TEST_DISTRIBUTION = require('./package.json').testDistribution === true;
+if (IS_TEST_DISTRIBUTION) {
+  const testDataPath = path.join(app.getPath('appData'), 'NhaYenZalo-Test');
+  fs.mkdirSync(testDataPath, { recursive: true });
+  app.setPath('userData', testDataPath);
+  app.setPath('sessionData', testDataPath);
+}
 const { spawn } = require('child_process');
 const QRCode = require('qrcode');
 const { RemoteControlService, normalizeRemoteInput } = require('./modules/remote-control');
@@ -42,11 +50,12 @@ const {
 const { UserScanStore, buildUserExtractorScript } = require('./modules/zalo-user-management');
 const { buildUnfriendBridgeProbeScript, buildDirectUnfriendScript } = require('./modules/zalo-unfriend-bridge');
 const { buildCompatibilityProbeScript } = require('./modules/zalo-compatibility');
-const { isSupportedVideoPath, stageVideoWithDebugger } = require('./modules/video-staging');
+const { isSupportedVideoPath } = require('./modules/video-staging');
 const {
   MAX_LIBRARY_VIDEO_BYTES,
   mediaStoreLayout,
   ensureMediaStore,
+  seedDefaultVideos,
   hashVideoFile,
   findDuplicateByHash,
   uniqueVideoFileName,
@@ -67,27 +76,40 @@ const {
 const { convertFileToPng, transcodeBufferToPng, destroyTranscoderWindow } = require('./modules/image-transcoder');
 const { computeViewGeometry, clampPopupWidth } = require('./modules/popup-layout');
 const cryptoStore = require('./modules/crypto-store');
+const { RecoveryController } = require('./modules/recovery-controller');
+const { appendRuntimeRecord, readJsonLines, sanitizeDiagnosticRecord, selectRecentRecords } = require('./modules/runtime-diagnostics');
 
 function copyFileToWindowsClipboard(filePath) {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') return resolve({ ok: false, message: 'Dán video từ clipboard hiện chỉ hỗ trợ Windows.' });
-    const script = '& { param([string]$filePath) ' + [
+    const encodedPath = Buffer.from(path.resolve(filePath), 'utf8').toString('base64');
+    const script = [
       'Add-Type -AssemblyName System.Windows.Forms',
+      '$filePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($env:NHAYEN_VIDEO_PATH_B64))',
+      'if (-not [System.IO.File]::Exists($filePath)) { throw "File not found" }',
       '$files = New-Object System.Collections.Specialized.StringCollection',
       '$files.Add($filePath) | Out-Null',
-      '[System.Windows.Forms.Clipboard]::SetFileDropList($files)',
-    ].join('; ') + ' }';
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', script, filePath], {
+      '$ok = $false',
+      'for ($i = 0; $i -lt 5 -and -not $ok; $i++) { try { [System.Windows.Forms.Clipboard]::SetFileDropList($files); $actual = [System.Windows.Forms.Clipboard]::GetFileDropList(); $ok = $actual.Count -eq 1 -and $actual[0] -eq $filePath } catch { Start-Sleep -Milliseconds 120 } }',
+      'if (-not $ok) { throw "Clipboard verification failed" }',
+    ].join('; ');
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', script], {
       windowsHide: true,
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'ignore', 'ignore'],
+      env: { ...process.env, NHAYEN_VIDEO_PATH_B64: encodedPath },
     });
-    let stderr = '';
-    const timer = setTimeout(() => { try { child.kill(); } catch {} resolve({ ok: false, message: 'Không thể sao chép video vào clipboard trong thời gian cho phép.' }); }, 10000);
-    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
-    child.once('error', (error) => { clearTimeout(timer); resolve({ ok: false, message: `Không mở được clipboard Windows: ${error.message || error}` }); });
-    child.once('exit', (code) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      resolve(code === 0 ? { ok: true } : { ok: false, message: stderr.trim() || 'Windows không chấp nhận video vào clipboard.' });
+      resolve(result);
+    };
+    const failure = { ok: false, message: 'Không thể sao chép video vào clipboard Windows. Hãy thử lại.' };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} finish(failure); }, 10000);
+    child.once('error', () => finish(failure));
+    child.once('exit', (code) => {
+      finish(code === 0 ? { ok: true } : failure);
     });
   });
 }
@@ -110,6 +132,7 @@ async function focusZaloComposerAndPasteFile(view, filePath) {
   const copied = await copyFileToWindowsClipboard(filePath);
   if (!copied.ok) return copied;
   view.webContents.focus();
+  await new Promise((resolve) => setTimeout(resolve, 100));
   view.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'V', modifiers: ['control'] });
   view.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'V', modifiers: ['control'] });
   return { ok: true };
@@ -120,7 +143,6 @@ const APP_ID = 'com.zalo.desktop';
 const SIDEBAR_WIDTH = 68;
 const TOPBAR_HEIGHT = 42;
 const DEFAULT_UTILITY_PANEL_WIDTH = 560;
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) app.quit();
@@ -255,7 +277,7 @@ function migrateStoreToEncrypted(key, salt) {
     if (cryptoStore.isEncryptedFileContent(trimmed)) continue; // đã mã hoá
     let obj;
     try { obj = JSON.parse(trimmed); } catch { continue; }      // không parse được -> bỏ
-    cryptoStore.backupFile(file, path.join(BACKUP_DIR, `${Date.now()}-${path.basename(file)}`));
+    if (!cryptoStore.backupFile(file, path.join(BACKUP_DIR, `${Date.now()}-${crypto.randomUUID()}-${path.basename(file)}`), key, salt)) throw new Error('Encrypted backup failed; migration stopped.');
     cryptoStore.writeStoreFile(file, obj, key, salt);
     migrated++;
   }
@@ -298,7 +320,11 @@ function applyUnlock(password, remember) {
   storeUnlocked = true;
   appLocked = false; // mở khoá store là bỏ luôn khoá màn hình
   try { settings = loadSettings(); } catch {}
-  migrateStoreToEncrypted(masterKey, masterSalt);
+  try { migrateStoreToEncrypted(masterKey, masterSalt); }
+  catch {
+    storeUnlocked = false; appLocked = true; masterKey = null; masterSalt = null;
+    return { ok: false, message: 'Encrypted migration failed. Original data has been kept; check disk permissions.' };
+  }
   try { settings = loadSettings(); } catch {} // đọc lại bản đã mã hoá
   if (remember) rememberMasterPassword(pwd);
   return { ok: true };
@@ -307,7 +333,7 @@ function applyUnlock(password, remember) {
 function revealBrowserViewIfUnlocked() {
   if (!storeUnlocked) return;
   if (mainWindow && activeProfileId && browserViews[activeProfileId]) {
-    try { mainWindow.setBrowserView(browserViews[activeProfileId]); updateBrowserViewBounds(); } catch {}
+    try { showContentView(browserViews[activeProfileId]); updateBrowserViewBounds(); } catch {}
   }
 }
 
@@ -408,7 +434,7 @@ function safeJsonRead(file, fallback) {
     return { ...fallback, ...JSON.parse(fs.readFileSync(file, 'utf8')) };
   } catch { return { ...fallback }; }
 }
-function safeJsonWrite(file, data) {
+function safeJsonWrite(file, data, strict = false) {
   ensureDir(path.dirname(file));
   try {
     if (isWorkspaceDataFile(file)) {
@@ -422,10 +448,10 @@ function safeJsonWrite(file, data) {
       try {
         const raw = fs.readFileSync(file, 'utf8');
         if (cryptoStore.isEncryptedFileContent(raw)) return;
-      } catch {}
+      } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }
     }
     fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
-  } catch {}
+  } catch (error) { if (strict) throw error; }
 }
 function normalizeWorkspaceData(data = {}) {
   return {
@@ -454,7 +480,7 @@ function loadWorkspaceIndex() {
 }
 function getWorkspaceFile(id) { return path.join(WORKSPACES_DIR, id, 'data.json'); }
 function loadWorkspaceData(id) { return normalizeWorkspaceData(safeJsonRead(getWorkspaceFile(id), DEFAULT_WORKSPACE_DATA)); }
-function saveWorkspaceData(id, data) { safeJsonWrite(getWorkspaceFile(id), normalizeWorkspaceData(data)); }
+function saveWorkspaceData(id, data) { safeJsonWrite(getWorkspaceFile(id), normalizeWorkspaceData(data), true); }
 // Bo mau tin nhan nhanh nap san trong bo cai (assets/default-quick-replies).
 // Chi seed 1 lan khi cai moi (workspace con trong, chua co cot .qr-seeded). Anh di kem duoc
 // copy sang userData/quick-reply-images va imagePath tra ve duong dan tuyet doi may nguoi dung.
@@ -544,7 +570,7 @@ const QUICK_REPLY_IMAGE_DIR = path.join(app.getPath('userData'), 'quick-reply-im
 const BACKUP_DIR = path.join(app.getPath('userData'), 'backups', 'quick-replies');
 const IMAGE_MIGRATION_FLAG_PATH = path.join(app.getPath('userData'), 'quick-reply-images', '.png-migration.json');
 
-// Preload cua BrowserView chay trong sandbox nen khong the doc font tu dia.
+// Preload cua WebContentsView chay trong sandbox nen khong the doc font tu dia.
 // Main process doc mot lan roi gui kem theo 'get-settings'.
 let quicksandFontDataUrlCache = null;
 function getQuicksandFontDataUrl() {
@@ -580,6 +606,15 @@ function publicVideoItem(item) {
 }
 function videoFilePath(fileName) {
   return path.join(currentMediaLayout().videosDir, fileName);
+}
+
+function defaultVideosDirectory() {
+  return app.isPackaged ? path.join(process.resourcesPath, 'default-videos') : path.join(__dirname, 'assets', 'default-videos');
+}
+
+function seedPackagedDefaultVideos() {
+  const layout = ensureMediaStore(currentMediaRoot());
+  return seedDefaultVideos(layout, defaultVideosDirectory());
 }
 
 function backupStamp() {
@@ -711,10 +746,12 @@ const remoteControl = new RemoteControlService({
 let unreadCount = 0;
 const profileUnreadCounts = new Map();
 let browserViews = {};
+let attachedContentView = null;
+const recoveryControllers = new Map();
 let activeProfileId = null;
 let proxyCredentials = {};
 // Khoá màn hình ngay từ đầu nếu dữ liệu đã mã hoá mà chưa mở khoá được bằng DPAPI
-// (renderer hiện overlay bắt nhập master password, BrowserView tạm ẩn).
+// (renderer hiện overlay bắt nhập master password, WebContentsView tạm ẩn).
 let appLocked = needsMasterPasswordOverlay();
 let downloads = [];
 let updateState = { status: 'idle', progress: 0, message: 'Sẵn sàng kiểm tra cập nhật.' };
@@ -726,6 +763,31 @@ let crmSession = { baseUrl: '', token: '', refreshToken: '', user: null };
 const zaloGroupScans = new ScanStore();
 const zaloUserScans = new UserScanStore();
 
+function showContentView(view) {
+  if (!mainWindow || !view || attachedContentView === view) return;
+  if (attachedContentView) {
+    try { mainWindow.contentView.removeChildView(attachedContentView); } catch {}
+  }
+  mainWindow.contentView.addChildView(view);
+  attachedContentView = view;
+}
+
+function hideContentView(view = attachedContentView) {
+  if (!mainWindow || !view) return;
+  try { mainWindow.contentView.removeChildView(view); } catch {}
+  if (attachedContentView === view) attachedContentView = null;
+}
+
+function destroyProfileView(profileId) {
+  const view = browserViews[profileId];
+  if (!view) return;
+  hideContentView(view);
+  recoveryControllers.get(profileId)?.dispose();
+  recoveryControllers.delete(profileId);
+  try { if (!view.webContents.isDestroyed()) view.webContents.close(); } catch {}
+  delete browserViews[profileId];
+}
+
 function getProfileById(profileId) {
   return (getWorkspaceState().data.profiles || []).find((profile) => profile.id === profileId) || null;
 }
@@ -733,7 +795,7 @@ function getProfileById(profileId) {
 function normalizeCrmBaseUrl(value) {
   const url = new URL(String(value || '').trim());
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('CRM chỉ hỗ trợ địa chỉ HTTP hoặc HTTPS.');
-  url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/api\/v1$/i, '');
+  url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/api\/v1$/i, '').replace(/\/orders$/i, '');
   url.search = '';
   url.hash = '';
   return url.toString().replace(/\/$/, '');
@@ -1030,6 +1092,7 @@ function toggleBlockTyping(enable) { settings.blockTyping = enable; saveSettings
 function toggleZadarkShield(enable) { settings.zadarkShield = enable; saveSettings(settings); broadcastBlockSettings(); updateTrayMenu(); }
 
 function setupAutoUpdater() {
+  if (IS_TEST_DISTRIBUTION) return;
   autoUpdater.autoDownload = false;
   autoUpdater.logger = require('electron').app.isPackaged ? null : console;
   autoUpdater.on('checking-for-update', () => {
@@ -1086,7 +1149,7 @@ function setupAutoUpdater() {
   updatePoll.unref?.();
 }
 let isManualUpdateCheck = false;
-function checkForUpdates(manual = false) { isManualUpdateCheck = manual; autoUpdater.checkForUpdates().catch(err => setUpdateState({ status: 'error', message: (err.message || err.toString()).split('\n')[0] })); }
+function checkForUpdates(manual = false) { if (IS_TEST_DISTRIBUTION) return; isManualUpdateCheck = manual; autoUpdater.checkForUpdates().catch(err => setUpdateState({ status: 'error', message: (err.message || err.toString()).split('\n')[0] })); }
 function toggleAutoLaunch(enable) { settings.autoLaunch = enable; saveSettings(settings); app.setLoginItemSettings({ openAtLogin: enable, path: app.getPath('exe') }); }
 
 function updateBrowserViewBounds() {
@@ -1105,11 +1168,10 @@ function updateBrowserViewBounds() {
     width: geometry.viewWidth,
     height: Math.max(bounds.height - TOPBAR_HEIGHT, 0),
   });
-  view.setAutoResize({ width: true, height: true });
   sendToRenderer('popup-geometry', { popupOffsetX: geometry.popupOffsetX, popupWidth: popupPanelWidth, viewWidth: geometry.viewWidth });
 }
 function isInternalUrl(url) {
-  return ['chat.zalo.me', 'id.zalo.me', 'messenger.com', 'facebook.com', 'web.whatsapp.com', 'whatsapp.com', 'teams.microsoft.com', 'microsoft.com', 'live.com', 'office.com', 'google.com', 'gmail.com', 'web.telegram.org', 'telegram.org', 't.me'].some(d => url.includes(d));
+  return ['chat.zalo.me', 'id.zalo.me', 'messenger.com', 'facebook.com', 'web.whatsapp.com', 'whatsapp.com', 'teams.microsoft.com', 'microsoft.com', 'live.com', 'office.com', 'google.com', 'gmail.com', 'web.telegram.org', 'telegram.org', 't.me'].some(d => { try { const parsed = new URL(url); return parsed.protocol === 'https:' && !parsed.username && !parsed.password && (parsed.hostname === d || parsed.hostname.endsWith('.' + d)); } catch { return false; } });
 }
 function getProfilePlatform(profileId) {
   try {
@@ -1119,32 +1181,47 @@ function getProfilePlatform(profileId) {
   } catch { return 'zalo'; }
 }
 function setupWebContents(contents, profileId) {
-  contents.on('did-start-loading', () => sendToRenderer('profile-connection-state', { id: profileId, state: 'loading' }));
-  contents.on('did-stop-loading', () => sendToRenderer('profile-connection-state', { id: profileId, state: 'online' }));
-  // P1: tự phục hồi khi trang Zalo lỗi mạng / crash render / đơ — reload tối đa 3 lần, cách 5s.
-  // Bộ đếm reset khi trang load thành công; ERR_ABORTED (-3) là điều hướng bình thường nên bỏ qua.
-  let autoReloadAttempts = 0;
-  let autoReloadTimer = null;
-  const MAX_AUTO_RELOAD = 3;
-  const scheduleAutoReload = (reason) => {
-    if (autoReloadAttempts >= MAX_AUTO_RELOAD) return;
-    autoReloadAttempts += 1;
-    clearTimeout(autoReloadTimer);
-    autoReloadTimer = setTimeout(() => { if (!contents.isDestroyed()) contents.reload(); }, 5000);
+  const runtimeLogPath = path.join(app.getPath('userData'), 'zalo-runtime.jsonl');
+  const logRuntimeEvent = (type, detail = {}) => {
+    try {
+      const record = {
+        at: new Date().toISOString(),
+        profileId,
+        type,
+        url: contents.getURL(),
+        proxy: getProfileById(profileId)?.proxy || '',
+        ...detail,
+      };
+      appendRuntimeRecord(runtimeLogPath, record);
+    } catch {}
   };
+  const recovery = new RecoveryController({
+    reload: () => { if (!contents.isDestroyed()) contents.reload(); },
+    log: logRuntimeEvent,
+  });
+  recoveryControllers.set(profileId, recovery);
+  contents.on('did-start-loading', () => sendToRenderer('profile-connection-state', { id: profileId, state: 'loading' }));
+  contents.on('did-stop-loading', () => {
+    sendToRenderer('profile-connection-state', { id: profileId, state: 'online' });
+    logRuntimeEvent('did-stop-loading');
+  });
   contents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (!isMainFrame || errorCode === -3) return;
     sendToRenderer('profile-connection-state', { id: profileId, state: 'error' });
-    scheduleAutoReload(errorDescription);
+    logRuntimeEvent('did-fail-load', { errorCode, errorDescription: String(errorDescription || '') });
+    recovery.mainFrameFailed(errorCode, errorDescription);
   });
   contents.on('render-process-gone', (event, details) => {
-    if (details.reason === 'clean-exit' || details.reason === 'killed') return;
-    scheduleAutoReload(details.reason);
+    logRuntimeEvent('render-process-gone', { reason: details.reason, exitCode: details.exitCode });
+    recovery.rendererGone(details.reason, details.exitCode);
   });
   contents.on('unresponsive', () => {
-    if (autoReloadAttempts >= MAX_AUTO_RELOAD) return;
-    autoReloadAttempts += 1;
-    if (!contents.isDestroyed()) contents.reload();
+    logRuntimeEvent('unresponsive');
+    sendToRenderer('profile-connection-state', { id: profileId, state: 'error' });
+  });
+  contents.on('responsive', () => {
+    logRuntimeEvent('responsive');
+    sendToRenderer('profile-connection-state', { id: profileId, state: recovery.snapshot().state });
   });
   contents.setWindowOpenHandler(({ url }) => {
     if (url === 'about:blank' || url.startsWith('blob:') || url.startsWith('file:')) return { action: 'allow' };
@@ -1190,7 +1267,8 @@ function setupWebContents(contents, profileId) {
     if (menu.items.length > 0) menu.popup({ window: mainWindow });
   });
   contents.on('did-finish-load', () => {
-    autoReloadAttempts = 0; // trang da tai xong -> cho phep phuc hoi day du lan o loi ke tiep
+    recovery.loaded();
+    logRuntimeEvent('did-finish-load', { recoveryAttempts: recovery.snapshot().reloadAttempts });
     try {
       const currentUrl = contents.getURL();
       const host = new URL(currentUrl).hostname || '';
@@ -1208,6 +1286,7 @@ function setupWebContents(contents, profileId) {
       contents.insertCSS(fs.readFileSync(path.join(__dirname, 'custom_style.css'), 'utf8'));
       if (platformClass === 'platform-zalo') {
         contents.send('quick-reply:ensure-ready', { replies: getWorkspaceState().data.quickReplies || [] });
+        contents.send('conversation-filter:set', { mode: 'all' });
         scheduleConversationDiag(contents, profileId);
       }
     } catch (e) { }
@@ -1248,6 +1327,62 @@ function scheduleConversationDiag(contents, profileId) {
       }
     } catch {}
   }, 6000);
+}
+
+function runtimeLogPath() {
+  return path.join(app.getPath('userData'), 'zalo-runtime.jsonl');
+}
+
+function collectRuntimePressure() {
+  return app.getAppMetrics().map((metric) => ({
+    pid: metric.pid,
+    type: metric.type,
+    cpuPercent: Number(metric.cpu?.percentCPUUsage || 0).toFixed(1),
+    workingSetKb: metric.memory?.workingSetSize || 0,
+  }));
+}
+
+function backupPartitionCriticalData(partition) {
+  const partitionName = String(partition || '').replace(/^persist:/, '');
+  if (!partitionName || /[\\/:*?"<>|]/.test(partitionName)) throw new Error('Partition tài khoản không hợp lệ.');
+  const sourceRoot = path.join(app.getPath('userData'), 'Partitions', partitionName);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const targetRoot = path.join(app.getPath('userData'), 'RecoveryBackups', `${partitionName}-${stamp}`);
+  const criticalEntries = ['IndexedDB', 'Local Storage', 'Session Storage', 'Service Worker', 'Cookies', path.join('Network', 'Cookies')];
+  let copied = 0;
+  for (const relative of criticalEntries) {
+    const source = path.join(sourceRoot, relative);
+    if (!fs.existsSync(source)) continue;
+    const target = path.join(targetRoot, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.cpSync(source, target, { recursive: true, force: false, errorOnExist: false });
+    copied++;
+  }
+  if (!copied) return '';
+  fs.writeFileSync(path.join(targetRoot, 'backup-info.json'), JSON.stringify({ at: new Date().toISOString(), partition: partitionName, entries: criticalEntries }, null, 2));
+  return targetRoot;
+}
+
+async function exportRecentDiagnostics() {
+  const now = Date.now();
+  const records = selectRecentRecords(readJsonLines(runtimeLogPath()), { now, windowMs: 10 * 60_000 }).map(sanitizeDiagnosticRecord);
+  const report = {
+    generatedAt: new Date(now).toISOString(),
+    windowMinutes: 10,
+    app: { version: app.getVersion(), electron: process.versions.electron, chromium: process.versions.chrome, node: process.versions.node },
+    system: { platform: process.platform, release: os.release(), arch: process.arch, totalMemoryMb: Math.round(os.totalmem() / 1048576), freeMemoryMb: Math.round(os.freemem() / 1048576) },
+    profiles: Object.keys(browserViews).map((id) => ({ id, state: recoveryControllers.get(id)?.snapshot() || null })),
+    processes: collectRuntimePressure(),
+    events: records,
+  };
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: 'Xuất chẩn đoán Nhà Yến Zalo',
+    defaultPath: path.join(app.getPath('documents'), `Nha-Yen-Zalo-chan-doan-${new Date(now).toISOString().slice(0, 10)}.json`),
+    filters: [{ name: 'Tệp chẩn đoán JSON', extensions: ['json'] }],
+  });
+  if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+  fs.writeFileSync(result.filePath, JSON.stringify(report, null, 2), 'utf8');
+  return { ok: true, filePath: result.filePath, eventCount: records.length };
 }
 
 function setupDownloads(sess) {
@@ -1366,6 +1501,19 @@ function createWindow() {
   mainWindow.on('resize', updateBrowserViewBounds);
   mainWindow.on('maximize', updateBrowserViewBounds);
   mainWindow.on('unmaximize', updateBrowserViewBounds);
+  const pressureTimer = setInterval(() => {
+    try {
+      appendRuntimeRecord(runtimeLogPath(), {
+        at: new Date().toISOString(),
+        type: 'runtime-pressure',
+        activeProfileId,
+        loadedProfiles: Object.keys(browserViews).length,
+        freeMemoryMb: Math.round(os.freemem() / 1048576),
+        processes: collectRuntimePressure(),
+      });
+    } catch {}
+  }, 60_000);
+  pressureTimer.unref?.();
   mainWindow.on('close', (event) => {
     if (!isQuitting && settings.minimizeToTray) { event.preventDefault(); mainWindow.hide(); return; }
     settings.windowBounds = mainWindow.getBounds(); saveSettings(settings);
@@ -1375,10 +1523,10 @@ function createWindow() {
     if (appLocked || !storeUnlocked) return;
     activeProfileId = profile.id;
     if (!browserViews[profile.id]) {
-      // backgroundThrottling: false — Zalo Web chay trong BrowserView an van phai giu
-      // timer/WebSocket/Raf song; mac dinh Chromium se giam timer khi view khong hien thi
-      // lam tin nhan den tre hoac mat thong bao khi nhan vien mo tab khac.
-      const view = new BrowserView({ webPreferences: { partition: profile.partition, preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
+      // Zalo can timer realtime de dong bo tin nhan khi view an. Cac nen tang khac
+      // duoc throttle de giam ap luc CPU/RAM; runtime-pressure se cho so lieu de dieu chinh.
+      const keepRealtime = profile.platform === 'zalo';
+      const view = new WebContentsView({ webPreferences: { partition: profile.partition, preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, backgroundThrottling: !keepRealtime } });
       browserViews[profile.id] = view;
       setupWebContents(view.webContents, profile.id);
       const sess = session.fromPartition(profile.partition);
@@ -1389,7 +1537,7 @@ function createWindow() {
         else if (parts.length === 2 && !profile.proxy.includes('://')) proxyRules = `http://${parts[0]}:${parts[1]}`;
         sess.setProxy({ proxyRules });
       } else sess.setProxy({ proxyRules: 'direct://' });
-      let url = ZALO_URL; let ua = USER_AGENT;
+      let url = ZALO_URL;
       if (profile.platform === 'messenger') url = 'https://www.messenger.com/';
       else if (profile.platform === 'fanpage') url = 'https://www.facebook.com/latest/inbox/';
       else if (profile.platform === 'facebook') url = 'https://www.facebook.com/';
@@ -1398,18 +1546,18 @@ function createWindow() {
       else if (profile.platform === 'gmail') url = 'https://mail.google.com/';
       else if (profile.platform === 'telegram') url = 'https://web.telegram.org/a/';
       else if (profile.platform === 'custom' && profile.customUrl) url = profile.customUrl;
-      view.webContents.loadURL(url, { userAgent: ua });
+      // Dùng User-Agent thật của Chromium đi kèm Electron để máy chủ không gửi bundle
+      // dành cho một Chrome mới hơn engine thực tế.
+      view.webContents.loadURL(url);
     }
     if (isBrowserViewVisible) {
-      mainWindow.setBrowserView(browserViews[profile.id]); updateBrowserViewBounds();
+      showContentView(browserViews[profile.id]); updateBrowserViewBounds();
     }
   });
   ipcMain.on('update-profile-settings', (event, profile) => {
     cancelProfileScans(profile.id);
     if (browserViews[profile.id]) {
-      if (activeProfileId === profile.id && mainWindow) mainWindow.setBrowserView(null);
-      browserViews[profile.id].webContents.destroy();
-      delete browserViews[profile.id];
+      destroyProfileView(profile.id);
     }
     const sess = session.fromPartition(profile.partition);
     setupDownloads(sess);
@@ -1424,8 +1572,8 @@ function createWindow() {
     if (!mainWindow) return;
     isBrowserViewVisible = visible;
     if (visible && !appLocked && activeProfileId && browserViews[activeProfileId]) {
-      mainWindow.setBrowserView(browserViews[activeProfileId]); updateBrowserViewBounds();
-    } else mainWindow.setBrowserView(null);
+      showContentView(browserViews[activeProfileId]); updateBrowserViewBounds();
+    } else hideContentView();
   });
   ipcMain.on('set-popup-width', (event, requestedWidth) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) return;
@@ -1441,11 +1589,19 @@ function createWindow() {
     utilityPanelWidth = Number.isFinite(next) ? Math.max(0, Math.min(620, Math.round(next))) : DEFAULT_UTILITY_PANEL_WIDTH;
     updateBrowserViewBounds();
   });
+  ipcMain.handle('app:copy-text', async (event, text) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) return { ok: false };
+    if (typeof text !== 'string' || !text.trim() || text.length > 100000) return { ok: false };
+    try {
+      await clipboard.writeText(text);
+      return { ok: true };
+    } catch { return { ok: false }; }
+  });
   ipcMain.handle('crm:login', async (event, payload = {}) => {
     if (!storeUnlocked) return { ok: false, locked: true, message: 'Vui lòng mở khoá dữ liệu trước.' };
     if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, message: 'Nguồn yêu cầu không hợp lệ.' };
     try {
-      const baseUrl = normalizeCrmBaseUrl(payload.baseUrl || 'http://localhost:3000');
+      const baseUrl = normalizeCrmBaseUrl(payload.baseUrl || 'https://nhayenpos.web.app');
       const response = await fetch(`${baseUrl}/api/v1/auth/login`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: String(payload.identifier || '').trim(), password: String(payload.password || '') }),
@@ -1460,8 +1616,7 @@ function createWindow() {
       };
       if (!crmSession.token) throw new Error('CRM không trả access token.');
       if (!crmSession.user) crmSession.user = await crmFetch('/profile');
-      const accounts = await crmFetch('/zalo-accounts');
-      return { ok: true, baseUrl, user: crmSession.user, accounts: Array.isArray(accounts) ? accounts : accounts.accounts || [] };
+      return { ok: true, baseUrl, user: crmSession.user };
     } catch (error) {
       crmSession = { baseUrl: '', token: '', refreshToken: '', user: null };
       return { ok: false, message: error.message || String(error) };
@@ -1484,7 +1639,7 @@ function createWindow() {
     try { return { ok: true, data: await pancakeFetch(payload.path, { method: payload.method, body: payload.body }) }; }
     catch (error) { return { ok: false, message: error.message || String(error) }; }
   });
-  ipcMain.on('delete-profile', (event, id) => { cancelProfileScans(id); profileUnreadCounts.delete(id); if (browserViews[id]) { browserViews[id].webContents.destroy(); delete browserViews[id]; } });
+  ipcMain.on('delete-profile', (event, id) => { cancelProfileScans(id); profileUnreadCounts.delete(id); destroyProfileView(id); });
 
   ipcMain.on('profile-info-extracted', (event, info) => {
     let senderId = null;
@@ -1492,6 +1647,12 @@ function createWindow() {
       if (view.webContents === event.sender) { senderId = id; break; }
     }
     if (senderId) sendToRenderer('update-profile-info', { id: senderId, name: info.name, avatarUrl: info.avatar });
+  });
+  ipcMain.on('zalo-network-state', (event, payload = {}) => {
+    const entry = Object.entries(browserViews).find(([, view]) => view?.webContents === event.sender);
+    if (!entry) return;
+    const [profileId] = entry;
+    recoveryControllers.get(profileId)?.networkChanged(payload.online !== false);
   });
   ipcMain.on('current-chat-info-extracted', (event, info) => {
     let senderId = null;
@@ -1555,6 +1716,49 @@ function createWindow() {
       if (hadNewMessages && mainWindow && !mainWindow.isFocused()) mainWindow.flashFrame(true);
     }
   });
+  ipcMain.on('profile-unread-count-detail', (event, payload) => {
+    let senderId = null;
+    for (const [id, view] of Object.entries(browserViews)) {
+      if (view.webContents === event.sender) { senderId = id; break; }
+    }
+    if (!senderId) return;
+    const clamp = (v) => Math.max(0, Math.min(9999, Math.trunc(Number(v) || 0)));
+    const data = payload || {};
+    sendToRenderer('update-profile-badge-detail', {
+      id: senderId,
+      total: clamp(data.total),
+      personalUnread: clamp(data.personalUnread),
+      groupUnread: clamp(data.groupUnread),
+    });
+  });
+  ipcMain.on('conv-diag', (event, payload) => {
+    try {
+      const logPath = path.join(app.getPath('userData'), 'conv-diag2.json');
+      fs.appendFileSync(logPath, JSON.stringify(payload || {}) + "\n");
+    } catch (e) {}
+  });
+  ipcMain.on('conv-diag3', (event, payload) => {
+    try {
+      const logPath = path.join(app.getPath('userData'), 'conv-diag3.json');
+      fs.appendFileSync(logPath, JSON.stringify(payload || {}) + "\n");
+    } catch (e) {}
+  });
+  ipcMain.on('conv-diag4', (event, payload) => {
+    try {
+      const logPath = path.join(app.getPath('userData'), 'conv-diag4.json');
+      fs.appendFileSync(logPath, JSON.stringify(payload || {}) + "\n");
+    } catch (e) {}
+  });
+  ipcMain.on('conversation-filter:set', (event, payload) => {
+    if (!storeUnlocked) return;
+    const mode = (payload && payload.mode) || 'all';
+    if (mode !== 'all' && mode !== 'personal' && mode !== 'group') return;
+    const profileId = payload && payload.profileId;
+    const view = profileId && browserViews[profileId];
+    if (view && view.webContents && !view.webContents.isDestroyed()) {
+      view.webContents.send('conversation-filter:set', { mode });
+    }
+  });
   ipcMain.handle('remote-control:start', async (event, options = {}) => {
     try {
       await stopRemoteControl();
@@ -1591,20 +1795,26 @@ function createWindow() {
     return id ? { id, name: 'Nhà Yến Zalo.exe' } : null;
   });
   ipcMain.on('remote-input-event', (event, payload = {}) => {
+    if (appLocked || !storeUnlocked) return;
     if (!remoteControl.getState().running || !mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
     payload = normalizeRemoteInput(payload);
     if (!payload) return;
     const view = activeProfileId && browserViews[activeProfileId];
     const x = Math.round((payload.x ?? 0) * mainWindow.getContentBounds().width);
     const y = Math.round((payload.y ?? 0) * mainWindow.getContentBounds().height);
-    const targetsBrowser = !!view && x >= SIDEBAR_WIDTH && y >= TOPBAR_HEIGHT;
+    const keyboardInput = payload.kind === 'text' || payload.kind === 'key';
+    const viewBounds = view?.getBounds();
+    const targetsBrowser = !!view && (keyboardInput
+      ? view.webContents.isFocused()
+      : !!viewBounds && x >= viewBounds.x && y >= viewBounds.y && x < viewBounds.x + viewBounds.width && y < viewBounds.y + viewBounds.height);
+    if (keyboardInput && !targetsBrowser) return;
     const target = targetsBrowser ? view.webContents : mainWindow.webContents;
     if (!target || target.isDestroyed()) return;
     if (payload.kind === 'mouse' && ['mouseDown', 'mouseUp', 'mouseMove'].includes(payload.type)) {
       const inputEvent = {
         type: payload.type,
-        x: targetsBrowser ? x - SIDEBAR_WIDTH : x,
-        y: targetsBrowser ? y - TOPBAR_HEIGHT : y,
+        x: targetsBrowser ? x - viewBounds.x : x,
+        y: targetsBrowser ? y - viewBounds.y : y,
       };
       if (payload.type !== 'mouseMove') {
         inputEvent.button = ['left', 'right', 'middle'].includes(payload.button) ? payload.button : 'left';
@@ -1612,7 +1822,7 @@ function createWindow() {
       }
       target.sendInputEvent(inputEvent);
     } else if (payload.kind === 'wheel' && Number.isFinite(Number(payload.deltaY))) {
-      target.sendInputEvent({ type: 'mouseWheel', x: targetsBrowser ? x - SIDEBAR_WIDTH : x, y: targetsBrowser ? y - TOPBAR_HEIGHT : y, deltaX: 0, deltaY: Math.max(-500, Math.min(500, Number(payload.deltaY))) });
+      target.sendInputEvent({ type: 'mouseWheel', x: targetsBrowser ? x - viewBounds.x : x, y: targetsBrowser ? y - viewBounds.y : y, deltaX: 0, deltaY: Math.max(-500, Math.min(500, Number(payload.deltaY))) });
     } else if (payload.kind === 'text' && targetsBrowser) {
       const text = String(payload.text || '').slice(0, 4000).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
       if (text) target.insertText(text);
@@ -1890,10 +2100,8 @@ function createWindow() {
     if (wc && !wc.isDestroyed()) wc.setZoomFactor(safeFontSize / 16);
   });
   ipcMain.on('reload-page', () => activeProfileId && browserViews[activeProfileId]?.webContents.reload());
-  // P1: "Dọn cache Zalo (giữ đăng nhập)" — chỉ xoá HTTP cache, code cache, CacheStorage,
-  // ServiceWorker của partition đang chọn. KHÔNG đụng cookies / localStorage / IndexedDB
-  // nên tin nhắn và phiên đăng nhập Zalo được giữ nguyên; giúp hết lag do cache phình to.
-  ipcMain.handle('profile-clear-cache', async (event, profileId) => {
+  // Dọn nhẹ không đụng CacheStorage, ServiceWorker, cookies, localStorage hoặc IndexedDB.
+  ipcMain.handle('profile-clear-cache-light', async (event, profileId) => {
     if (!storeUnlocked) return { ok: false, locked: true };
     try {
       const ws = getWorkspaceState();
@@ -1902,13 +2110,36 @@ function createWindow() {
       const sess = session.fromPartition(profile.partition);
       await sess.clearCache();
       await sess.clearCodeCaches({});
-      await sess.clearStorageData({ storages: ['cachestorage', 'serviceworkers'] });
       const view = browserViews[profile.id];
       if (view && !view.webContents.isDestroyed()) view.webContents.reload();
       return { ok: true };
     } catch (e) {
       return { ok: false, message: e.message };
     }
+  });
+  ipcMain.handle('profile-repair-cache-deep', async (event, profileId) => {
+    if (!storeUnlocked) return { ok: false, locked: true };
+    try {
+      const profile = getProfileById(profileId || activeProfileId);
+      if (!profile?.partition) return { ok: false, message: 'Không tìm thấy tài khoản để sửa.' };
+      const sess = session.fromPartition(profile.partition);
+      await sess.flushStorageData();
+      const backupPath = backupPartitionCriticalData(profile.partition);
+      await sess.clearCache();
+      await sess.clearCodeCaches({});
+      await sess.clearStorageData({ storages: ['cachestorage', 'serviceworkers'] });
+      const view = browserViews[profile.id];
+      if (view && !view.webContents.isDestroyed()) view.webContents.reload();
+      appendRuntimeRecord(runtimeLogPath(), { at: new Date().toISOString(), profileId: profile.id, type: 'deep-cache-repair', backupCreated: !!backupPath });
+      return { ok: true, backupPath };
+    } catch (e) {
+      return { ok: false, message: e.message || String(e) };
+    }
+  });
+  ipcMain.handle('diagnostics-export', async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, message: 'Nguồn yêu cầu không hợp lệ.' };
+    try { return await exportRecentDiagnostics(); }
+    catch (error) { return { ok: false, message: error.message || String(error) }; }
   });
   ipcMain.on('get-settings', (event) => {
     if (!storeUnlocked) {
@@ -1920,10 +2151,17 @@ function createWindow() {
   });
   ipcMain.on('workspace-get-state', (event) => { event.returnValue = getWorkspaceState(); });
   ipcMain.on('workspace-save-data', (event, data) => {
-    if (!storeUnlocked) return;
-    const state = persistWorkspaceState(data || {});
-    broadcastQuickReplies(state.data.quickReplies);
-    event.returnValue = state;
+    if (!mainWindow || event.sender !== mainWindow.webContents || !storeUnlocked || appLocked) {
+      event.returnValue = { ok: false, message: 'Workspace is locked or request is not trusted.' };
+      return;
+    }
+    try {
+      const state = persistWorkspaceState(data || {});
+      broadcastQuickReplies(state.data.quickReplies);
+      event.returnValue = state;
+    } catch {
+      event.returnValue = { ok: false, message: 'Workspace could not be saved. Check disk space and permissions; your draft has been kept.' };
+    }
   });
   ipcMain.on('workspace-create', (event, name) => {
     if (!storeUnlocked) return;
@@ -2138,6 +2376,7 @@ function createWindow() {
     }
   });
   ipcMain.handle('quick-reply:paste-image', async (event, imagePath) => {
+    if (!storeUnlocked || appLocked) return { ok: false, locked: true, message: 'App locked.' };
     const view = Object.values(browserViews).find((entry) => entry?.webContents === event.sender);
     if (!view) return { ok: false, message: 'Tab Zalo không hợp lệ.' };
     const allowedPaths = new Set((getWorkspaceState().data.quickReplies || []).map((reply) => path.resolve(String(reply.imagePath || ''))).filter(Boolean));
@@ -2165,7 +2404,12 @@ function createWindow() {
       }
     }
     if (image.isEmpty()) return { ok: false, message: 'Ảnh mẫu bị lỗi, không dán được vào Zalo.' };
-    clipboard.writeImage(image);
+    try {
+      await clipboard.write([new ClipboardItem({ 'image/png': new Blob([image.toPNG()], { type: 'image/png' }) })]);
+    } catch {
+      return { ok: false, message: 'Clipboard write failed. Please retry.' };
+    }
+    if (appLocked || !storeUnlocked || event.sender.isDestroyed()) return { ok: false, message: 'Paste cancelled.' };
     event.sender.focus();
     event.sender.sendInputEvent({ type: 'keyDown', keyCode: 'V', modifiers: ['control'] });
     event.sender.sendInputEvent({ type: 'keyUp', keyCode: 'V', modifiers: ['control'] });
@@ -2188,7 +2432,7 @@ function createWindow() {
     if (!isSupportedVideoPath(videoPath)) return { ok: false, message: 'Định dạng video không được hỗ trợ.' };
     if (!fs.existsSync(videoPath)) return { ok: false, message: 'Video đã chọn không còn tồn tại.' };
 
-    const staged = await stageVideoWithDebugger(view.webContents.debugger, videoPath, view.webContents);
+    const staged = await focusZaloComposerAndPasteFile(view, videoPath);
     if (!staged.ok) return staged;
     view.webContents.focus();
     return { ok: true, message: 'Đã đưa video vào hội thoại. Video chưa được gửi; nhấn Enter khi anh muốn gửi.' };
@@ -2196,6 +2440,7 @@ function createWindow() {
   ipcMain.handle('video-library:list', async (event) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, message: 'Nguồn yêu cầu không hợp lệ.' };
     const layout = ensureMediaStore(currentMediaRoot());
+    seedPackagedDefaultVideos();
     return { ok: true, directory: layout.videosDir, mediaRoot: layout.root, items: readVideoLibrary().map(publicVideoItem) };
   });
   ipcMain.handle('video-library:add', async (event) => {
@@ -2330,10 +2575,18 @@ function createWindow() {
     const view = activeProfileId && browserViews[activeProfileId];
     if (!view || !(view.webContents.getURL() || '').includes('zalo.me')) return { ok: false, message: 'Hãy chọn nick và mở một hội thoại Zalo trước.' };
     const videoPath = videoFilePath(item.fileName);
-    if (!fs.existsSync(videoPath)) return { ok: false, message: 'Video không còn tồn tại.' };
-    const pasted = await focusZaloComposerAndPasteFile(view, videoPath);
-    if (!pasted.ok) return pasted;
-    return { ok: true, message: `Đã dán “${item.name}” vào hội thoại. Video chưa được gửi; hãy kiểm tra bản xem trước rồi nhấn Enter.` };
+    try {
+      const stat = fs.statSync(videoPath);
+      if (!stat.isFile() || !Number.isFinite(stat.size) || stat.size <= 0) {
+        return { ok: false, message: 'Video rỗng hoặc không hợp lệ, không thể đưa vào hội thoại.' };
+      }
+    } catch {
+      return { ok: false, message: 'Video không còn tồn tại hoặc không hợp lệ.' };
+    }
+    const staged = await focusZaloComposerAndPasteFile(view, videoPath);
+    if (!staged.ok) return staged;
+    view.webContents.focus();
+    return { ok: true, message: `Đã đưa “${item.name}” vào hội thoại. Video chưa được gửi; hãy kiểm tra bản xem trước rồi nhấn Enter.` };
   });
   ipcMain.handle('active-chat-insert-text', async (event, message = '', options = {}) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, message: 'Nguồn yêu cầu không hợp lệ.' };
@@ -2364,6 +2617,8 @@ function createWindow() {
     } catch (error) { return { ok: false, message: error.message || String(error) }; }
   });
   ipcMain.handle('active-chat-send-text', async (event, message = '', options = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, message: 'Untrusted request source.' };
+    if (appLocked || !storeUnlocked) return { ok: false, locked: true, message: 'App locked.' };
     if (!storeUnlocked) return { ok: false, locked: true, message: 'Vui lòng mở khoá dữ liệu trước.' };
     const requestedProfileId = options.profileId || activeProfileId;
     const view = requestedProfileId && browserViews[requestedProfileId];
@@ -2436,6 +2691,8 @@ function createWindow() {
     } catch (err) { return { ok: false, message: err.message || String(err) }; }
   });
   ipcMain.handle('zalo-switch-and-send', async (event, chatName, message, options = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, message: 'Untrusted request source.' };
+    if (appLocked || !storeUnlocked) return { ok: false, locked: true, message: 'App locked.' };
     const requestedProfileId = options.profileId || activeProfileId;
     const view = requestedProfileId && browserViews[requestedProfileId];
     if (!view || !message || !chatName) return { ok: false, message: 'Thiếu thông tin người nhận, tin nhắn, hoặc tab Zalo.' };
@@ -2865,8 +3122,8 @@ function createWindow() {
   }));
 }
 
-function lockApp() { appLocked = true; if (mainWindow) mainWindow.setBrowserView(null); sendToRenderer('lock-state', { locked: true, hasPassword: !!settings.lockPasswordHash, zadarkShield: settings.zadarkShield }); }
-function unlockApp(ok, removed = false) { if (ok) { appLocked = false; sendToRenderer('unlock-result', { ok: true, removed }); if (mainWindow && activeProfileId && browserViews[activeProfileId]) { mainWindow.setBrowserView(browserViews[activeProfileId]); updateBrowserViewBounds(); } } else sendToRenderer('unlock-result', { ok: false, message: 'Sai mật khẩu.' }); }
+function lockApp() { appLocked = true; if (mainWindow) hideContentView(); sendToRenderer('lock-state', { locked: true, hasPassword: !!settings.lockPasswordHash, zadarkShield: settings.zadarkShield }); }
+function unlockApp(ok, removed = false) { if (ok) { appLocked = false; sendToRenderer('unlock-result', { ok: true, removed }); if (mainWindow && activeProfileId && browserViews[activeProfileId]) { showContentView(browserViews[activeProfileId]); updateBrowserViewBounds(); } } else sendToRenderer('unlock-result', { ok: false, message: 'Sai mật khẩu.' }); }
 
 function updateBadge(count) {
   if (!mainWindow) return;

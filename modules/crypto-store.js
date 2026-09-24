@@ -92,6 +92,19 @@ function readStoreFile(filePath, key) {
 
 // Ghi atomic: tmp -> rename. plaintext nếu không có key, ngược lại mã hoá.
 function writeStoreFile(filePath, obj, key, salt) {
+  // Fail closed rather than replacing unreadable/corrupt user data with defaults.
+  let existing;
+  try { existing = fs.readFileSync(filePath, 'utf8'); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (existing !== undefined) {
+    let parsed;
+    try { parsed = JSON.parse(String(existing)); }
+    catch { throw new Error('Corrupt store: refusing overwrite; restore a verified backup first.'); }
+    if (isEncryptedPayload(parsed)) {
+      if (!key) throw new Error('Locked store: refusing plaintext overwrite.');
+      decryptObject(parsed, key);
+    }
+  }
   const dir = path.dirname(filePath);
   try { fs.mkdirSync(dir, { recursive: true }); } catch {}
   const text = key
@@ -108,11 +121,17 @@ function writeStoreFile(filePath, obj, key, salt) {
 }
 
 // Giữ 1 backup plaintext gần nhất (dùng khi migrate từ plaintext -> encrypted).
-function backupFile(filePath, backupPath) {
+function backupFile(filePath, backupPath, key, salt) {
   try {
     const raw = fs.readFileSync(filePath);
     fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-    fs.writeFileSync(backupPath, raw);
+    if (key) {
+      const object = JSON.parse(raw.toString('utf8'));
+      if (isEncryptedPayload(object)) throw new Error('Backup source must be plaintext for migration');
+      writeStoreFile(backupPath, object, key, salt);
+    } else {
+      fs.writeFileSync(backupPath, raw);
+    }
     return true;
   } catch { return false; }
 }

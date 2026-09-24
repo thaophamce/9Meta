@@ -178,7 +178,7 @@ class RemoteControlService {
   authorized(req) {
     const value = String(req.headers.authorization || "");
     const supplied = value.startsWith("Bearer ") ? value.slice(7) : "";
-    if (!supplied || !this.token || supplied.length !== this.token.length)
+    if (typeof supplied !== "string" || !supplied || !this.token || Buffer.byteLength(supplied) !== Buffer.byteLength(this.token))
       return false;
     return crypto.timingSafeEqual(
       Buffer.from(supplied),
@@ -187,7 +187,7 @@ class RemoteControlService {
   }
 
   tokenMatches(supplied) {
-    if (!supplied || !this.token || supplied.length !== this.token.length)
+    if (typeof supplied !== "string" || !supplied || !this.token || Buffer.byteLength(supplied) !== Buffer.byteLength(this.token))
       return false;
     return crypto.timingSafeEqual(
       Buffer.from(supplied),

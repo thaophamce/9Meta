@@ -9,6 +9,7 @@ const {
   MAX_LIBRARY_VIDEO_BYTES,
   mediaStoreLayout,
   ensureMediaStore,
+  seedDefaultVideos,
   hashVideoFile,
   findDuplicateByHash,
   uniqueVideoFileName,
@@ -24,6 +25,42 @@ const {
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'nyz-media-'));
 }
+
+test('video mac dinh duoc seed mot lan va khong khoi phuc sau khi nguoi dung xoa', () => {
+  const root = tempRoot();
+  const source = path.join(root, 'defaults');
+  const layout = ensureMediaStore(path.join(root, 'media'));
+  fs.mkdirSync(source);
+  fs.writeFileSync(path.join(source, 'demo.mp4'), Buffer.alloc(32, 1));
+  fs.writeFileSync(path.join(source, 'default-videos.json'), JSON.stringify([{ id: 'demo-v1', name: 'Demo', fileName: 'demo.mp4' }]));
+  const first = seedDefaultVideos(layout, source, { now: () => 123 });
+  assert.strictEqual(first.added.length, 1);
+  assert.strictEqual(readVideoLibraryRows(layout).length, 1);
+  fs.unlinkSync(path.join(layout.videosDir, first.added[0].fileName));
+  writeVideoLibraryRows(layout, []);
+  const second = seedDefaultVideos(layout, source);
+  assert.strictEqual(second.added.length, 0);
+  assert.deepStrictEqual(second.skipped, ['demo-v1']);
+  assert.strictEqual(readVideoLibraryRows(layout).length, 0);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('video mac dinh trung noi dung khong tao ban sao', () => {
+  const root = tempRoot();
+  const source = path.join(root, 'defaults');
+  const layout = ensureMediaStore(path.join(root, 'media'));
+  fs.mkdirSync(source);
+  fs.writeFileSync(path.join(source, 'demo.mp4'), 'same');
+  fs.writeFileSync(path.join(layout.videosDir, 'user.mp4'), 'same');
+  const hash = hashVideoFile(path.join(source, 'demo.mp4'));
+  writeVideoLibraryRows(layout, [{ id: 'user', name: 'User', fileName: 'user.mp4', hash }]);
+  fs.writeFileSync(path.join(source, 'default-videos.json'), JSON.stringify([{ id: 'demo-v1', fileName: 'demo.mp4' }]));
+  const result = seedDefaultVideos(layout, source);
+  assert.strictEqual(result.added.length, 0);
+  assert.deepStrictEqual(result.skipped, ['demo-v1']);
+  assert.strictEqual(fs.readdirSync(layout.videosDir).length, 1);
+  fs.rmSync(root, { recursive: true, force: true });
+});
 
 test('bo cuc kho media tach videos, thumbnails, trash va danh sach', () => {
   const layout = mediaStoreLayout('C:/kho/media');
@@ -80,6 +117,12 @@ test('planVideoAddition tu choi dinh dang la va tep qua lon', () => {
   assert.strictEqual(ok.ok, true);
   assert.strictEqual(ok.size, 64);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('planVideoAddition tu choi tep video rong', () => {
+  const result = planVideoAddition('empty.mp4', [], { statSync: () => ({ size: 0 }) });
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.reason, 'empty');
 });
 
 test('ten tep khong de tep cu', () => {

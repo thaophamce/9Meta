@@ -1,4 +1,4 @@
-// Preload cua BrowserView Zalo chay trong sandbox (Electron >= 20 bat sandbox mac dinh).
+// Preload cua WebContentsView Zalo chay trong sandbox (Electron >= 20 bat sandbox mac dinh).
 // Trong sandbox, preload CHI require duoc 'electron' va vai module built-in duoc phep.
 // Neu them require('fs') / require('path') thi CA preload khong load duoc, keo theo:
 //   - mat contextBridge 'messengerApp'  -> Tin nhan nhanh khong hoat dong
@@ -9,9 +9,29 @@ const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const PRELOAD_PATH = path.join(__dirname, '..', 'preload.js');
 const preloadSource = fs.readFileSync(PRELOAD_PATH, 'utf8');
+
+test('main-world injection remains valid JavaScript', () => {
+  const injected = [];
+  const electron = {
+    contextBridge: { exposeInMainWorld() {} },
+    ipcRenderer: { sendSync() { return {}; }, send() {}, invoke() { return Promise.resolve(); }, on() {} },
+    webFrame: { executeJavaScript(script) { injected.push(script); return Promise.resolve(); } },
+  };
+  const sandbox = {
+    require(name) { if (name === 'electron') return electron; throw new Error(`unexpected require: ${name}`); },
+    Buffer, console, URL, __dirname: path.dirname(PRELOAD_PATH),
+    setTimeout() { return 0; }, setInterval() { return 0; }, clearTimeout() {}, clearInterval() {},
+    window: {}, location: { hostname: 'chat.zalo.me' },
+    document: { readyState: 'loading', addEventListener() {} },
+  };
+  vm.runInNewContext(preloadSource, sandbox, { filename: PRELOAD_PATH });
+  assert.ok(injected.length, 'expected main-world injection script');
+  assert.doesNotThrow(() => new Function(injected[0]));
+});
 
 // Module duoc phep require trong preload sandbox.
 const SANDBOX_SAFE_MODULES = new Set(['electron', 'events', 'timers', 'url']);

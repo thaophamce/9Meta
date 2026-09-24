@@ -113,3 +113,8 @@ test('backupFile: giữ bản gốc trước khi migrate', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+test('encrypted migration backup preserves recoverability without plaintext',()=>{const source={fixture:'PRIVATE_FIXTURE'};const key=cs.deriveKey('fixture-only',cs.generateSalt());const salt=cs.generateSalt();const originalRead=fs.readFileSync,originalWrite=fs.writeFileSync,originalMkdir=fs.mkdirSync,originalRename=fs.renameSync;let written;try{fs.readFileSync=()=>Buffer.from(JSON.stringify(source));fs.mkdirSync=()=>{};fs.writeFileSync=(p,b)=>{written=String(b)};fs.renameSync=()=>{};assert.equal(cs.backupFile('fixture.json','fixture.bak',key,salt),true);assert.equal(cs.isEncryptedFileContent(written),true);assert.deepEqual(cs.decryptObject(JSON.parse(written),key),source)}finally{fs.readFileSync=originalRead;fs.writeFileSync=originalWrite;fs.mkdirSync=originalMkdir;fs.renameSync=originalRename}});
+test('writeStoreFile refuses to overwrite corrupt or inaccessible existing data',()=>{
+ const originalRead=fs.readFileSync,originalWrite=fs.writeFileSync,originalMkdir=fs.mkdirSync;let writes=0;
+ try {fs.mkdirSync=()=>{};fs.writeFileSync=()=>{writes++};fs.readFileSync=()=>'{broken';assert.throws(()=>cs.writeStoreFile('fixture.json',{},null,null),/corrupt/i);fs.readFileSync=()=>{throw Object.assign(new Error('denied'),{code:'EACCES'})};assert.throws(()=>cs.writeStoreFile('fixture.json',{},null,null),/denied/);assert.equal(writes,0)}finally{fs.readFileSync=originalRead;fs.writeFileSync=originalWrite;fs.mkdirSync=originalMkdir}
+});

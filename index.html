@@ -202,6 +202,13 @@
     .topbar-primary:hover { background: #1259c0; border-color: #1259c0; }
     .topbar-quote { height: 32px; padding: 0 11px; border: 1px solid #d8dee8; border-radius: 8px; background: #fff; color: #1767d9; font-weight: 700; cursor: pointer; white-space: nowrap; }
     .topbar-quote:hover, .topbar-quote.active { color: #fff; border-color: #1767d9; background: #1767d9; }
+    .topbar-filter { display:flex; align-items:center; gap:5px; margin-left:12px; margin-right:auto; -webkit-app-region:no-drag; }
+    .topbar-filter[hidden] { display:none !important; }
+    .topbar-chip { height:32px; padding:0 10px; border:1px solid #d8dee8; border-radius:999px; background:#fff; color:#334155; font-size:12px; font-weight:700; cursor:pointer; white-space:nowrap; -webkit-app-region:no-drag; }
+    .topbar-chip:hover { border-color:#1767d9; color:#1767d9; }
+    .topbar-chip.active { border-color:#1767d9; background:#1767d9; color:#fff; }
+    .topbar-chip-count { margin-left:3px; font-weight:800; }
+    .topbar-chip-count:empty { display:none; }
 
     .topbar-more {
       width: 36px;
@@ -1340,7 +1347,7 @@
     .design-card-bottom { margin-top:7px; justify-content:flex-start; flex-wrap:wrap; color:#64748b; font-size:12px; }
     .design-list-view { display:flex; min-height:0; flex:1; flex-direction:column; }
     .design-list-view[hidden] { display:none; }
-    .design-editor { display:flex; min-height:0; flex:1; flex-direction:column; margin:0 10px 10px; padding:10px; border:1px solid #dfe5ee; border-radius:10px; background:#fff; }
+    .design-editor { display:flex; min-height:0; flex:1; flex-direction:column; margin:0 10px 10px; padding:10px; border:1px solid #dfe5ee; border-radius:10px; background:#fff; overflow-y:auto; }
     .design-editor[hidden] { display:none; }
     .design-editor-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
     .design-editor-head h3 { margin:0; font-size:16px; }
@@ -1348,6 +1355,29 @@
     .design-editor .modal-input,.design-editor .modal-select { min-height:38px; padding:7px 10px; }
     .design-editor .modal-textarea { min-height:72px; max-height:96px; }
     .design-editor-actions { margin-top:auto; padding-top:8px; }
+    .design-options { display:grid; gap:6px; grid-column:1/-1; }
+    .design-option { display:grid; grid-template-columns:22px 28px minmax(0,1fr); align-items:center; gap:7px; min-height:50px; padding:7px 9px; border:1px solid #dfe5ee; border-radius:8px; background:#fff; color:#334155; cursor:pointer; }
+    .design-option:hover { border-color:#93c5fd; background:#f8fbff; }
+    .design-option:has(input:checked) { border-color:#93c5fd; background:#eff6ff; }
+    .design-option input { width:17px; height:17px; margin:0; accent-color:#1767d9; }
+    .design-option-icon { display:grid; place-items:center; font-size:18px; }
+    .design-option-copy { min-width:0; }
+    .design-option-copy strong,.design-option-copy small { display:block; }
+    .design-option-copy strong { font-size:12px; }
+    .design-option-copy small { margin-top:2px; color:#7b8495; font-size:10px; line-height:1.25; }
+    .design-activity-card { grid-column:1/-1; border:1px solid #dfe5ee; border-radius:8px; overflow:hidden; background:#f8fafc; }
+    .design-activity-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; border-bottom:1px solid #e8edf3; background:#fff; }
+    .design-activity-head strong { font-size:12px; color:#334155; }
+    .design-activity-count { color:#7b8495; font-size:10px; }
+    .design-activity-list { max-height:190px; overflow-y:auto; padding:4px 8px; }
+    .design-activity-empty { padding:14px 8px; color:#7b8495; text-align:center; font-size:11px; }
+    .design-activity-item { display:grid; grid-template-columns:22px minmax(0,1fr) auto; gap:7px; align-items:center; padding:7px 2px; border-bottom:1px solid #e8edf3; }
+    .design-activity-item:last-child { border-bottom:0; }
+    .design-activity-icon { display:grid; place-items:center; width:22px; height:22px; border-radius:6px; background:#eaf2ff; color:#1767d9; font-size:12px; }
+    .design-activity-copy strong,.design-activity-copy small { display:block; }
+    .design-activity-copy strong { font-size:11px; color:#1e293b; }
+    .design-activity-copy small { margin-top:2px; color:#64748b; font-size:10px; }
+    .design-activity-time { color:#7b8495; font-size:9px; white-space:nowrap; }
     .crm-panel-status { min-height:18px; padding:0 2px 8px; color:#1767d9; font-size:12px; }
     .pancake-panel { position:relative; background:#f3f5f9; font-family:var(--app-font-family); font-size:var(--ui-font-size); display:flex; flex-direction:column; overflow:hidden; }
     .pancake-panel * { font-family:inherit; }
@@ -1454,6 +1484,7 @@
     </div>
     <header id="app-topbar">
       <span class="topbar-brand"><img src="brand-logo.png" alt="">Nhà Yến Zalo<button id="app-version-badge" class="topbar-version" type="button" data-tool-action="update" title="Phiên bản ứng dụng · bấm để kiểm tra cập nhật" aria-label="Phiên bản ứng dụng, bấm để kiểm tra cập nhật"></button></span>
+      <div class="topbar-filter" id="topbar-filter" role="group" aria-label="Bộ lọc hội thoại" hidden><button id="filter-all" class="topbar-chip active" data-filter="all" type="button">Tất cả</button><button id="filter-personal" class="topbar-chip" data-filter="personal" type="button">Cá nhân <span class="topbar-chip-count" id="filter-personal-count"></span></button><button id="filter-group" class="topbar-chip" data-filter="group" type="button">Nhóm <span class="topbar-chip-count" id="filter-group-count"></span></button></div>
       <div class="topbar-actions">
         <button id="pancake-topbar-create" class="topbar-primary" type="button" title="Tạo đơn Pancake nhanh" aria-label="Tạo đơn Pancake">Tạo đơn</button>
         <button id="quick-replies-topbar" class="topbar-primary" type="button" title="Mở tin nhắn nhanh" aria-label="Mở tin nhắn nhanh" aria-expanded="false">Tin nhắn nhanh</button>
@@ -1481,12 +1512,12 @@
       <div id="utility-context" class="utility-context">Chọn một nick và mở cuộc trò chuyện Zalo.</div>
       <div id="crm-connection-box" class="crm-connect" hidden>
         <div id="crm-login-form">
-          <input id="crm-base-url" class="modal-input" value="https://nhayencrm.com" placeholder="Địa chỉ Nhà Yến CRM">
-          <input id="crm-identifier" class="modal-input" placeholder="Tài khoản CRM" style="margin-top:6px">
+          <input id="crm-base-url" class="modal-input" value="https://nhayenpos.web.app" placeholder="&#272;&#7883;a ch&#7881; Nh&#224; Y&#7871;n POS">
+          <input id="crm-identifier" class="modal-input" placeholder="T&#224;i kho&#7843;n Nh&#224; Y&#7871;n POS" style="margin-top:6px">
           <input id="crm-password" class="modal-input" type="password" placeholder="Mật khẩu" style="margin-top:6px">
-          <button id="crm-login" class="modal-btn save" type="button" style="margin-top:7px">Kết nối CRM</button>
+          <button id="crm-login" class="modal-btn save" type="button" style="margin-top:7px">K&#7871;t n&#7889;i Nh&#224; Y&#7871;n POS</button>
         </div>
-        <div id="crm-connected" hidden><div class="crm-connected-row"><select id="crm-account-select" class="modal-select"></select><button id="crm-logout" class="modal-btn cancel" type="button">Thoát</button></div></div>
+        <div id="crm-connected" hidden><div class="crm-connected-row"><span><span class="crm-dot"></span><b id="crm-user-name">&#272;&#227; k&#7871;t n&#7889;i Nh&#224; Y&#7871;n POS</b></span><button id="crm-logout" class="modal-btn cancel" type="button">Tho&#225;t</button></div></div>
         <div id="crm-status" class="utility-status" role="status"></div>
       </div>
       <section id="utility-pane-quote" class="utility-pane active" aria-labelledby="utility-tab-quote">
@@ -1529,6 +1560,15 @@
             <input id="design-deadline" class="modal-input" type="date">
             <input id="design-files" class="modal-input" type="number" min="0" placeholder="Số file">
             <textarea id="design-note" class="modal-textarea wide" placeholder="Ghi chú"></textarea>
+            <div class="design-options" aria-label="Thuộc tính đơn thiết kế">
+              <label class="design-option"><input id="design-urgent" type="checkbox"><span class="design-option-icon" aria-hidden="true">⚠</span><span class="design-option-copy"><strong>Đơn hàng GẤP</strong><small>Ưu tiên xử lý trước các đơn thông thường</small></span></label>
+              <label class="design-option"><input id="design-fee" type="checkbox"><span class="design-option-icon" aria-hidden="true">₫</span><span class="design-option-copy"><strong>Có phí thiết kế</strong><small>Cộng thêm 100.000đ vào đơn hàng</small></span></label>
+              <label class="design-option"><input id="design-outsource" type="checkbox"><span class="design-option-icon" aria-hidden="true">♙</span><span class="design-option-copy"><strong>Outsource</strong><small>Tính KPI Quang Trường</small></span></label>
+            </div>
+            <section class="design-activity-card" aria-labelledby="design-activity-title">
+              <div class="design-activity-head"><strong id="design-activity-title">↶ Lịch sử hoạt động</strong><span id="design-activity-count" class="design-activity-count">0 lần cập nhật</span></div>
+              <div id="design-activity" class="design-activity-list" aria-live="polite"><div class="design-activity-empty">Chưa có hoạt động</div></div>
+            </section>
           </div>
           <div class="design-editor-actions"><button id="design-save" class="modal-btn save" type="button" style="width:100%">Lưu</button><div id="design-status-message" class="crm-panel-status" role="status"></div></div>
         </div>
@@ -2083,7 +2123,9 @@
         placeholder="Nhập URL đầy đủ (VD: https://discord.com/app)"
         style="display:none;">
       <div class="row mt-16"><button class="modal-btn warn" id="modal-delete" style="display:none;">Xóa</button>
-        <button class="modal-btn cancel" id="modal-clear-cache" style="display:none;">Dọn cache (giữ đăng nhập)</button>
+        <button class="modal-btn cancel" id="modal-clear-cache" style="display:none;">Dọn cache nhẹ</button>
+        <button class="modal-btn cancel" id="modal-repair-cache" style="display:none;">Sửa cache sâu</button>
+        <button class="modal-btn cancel" id="modal-export-diagnostics" style="display:none;">Xuất chẩn đoán</button>
         <div><button class="modal-btn cancel" id="modal-cancel">Hủy</button><button class="modal-btn save"
             id="modal-save">Lưu</button></div>
       </div>

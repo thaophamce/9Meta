@@ -210,8 +210,7 @@ test('all five business panels use the same professional 560px dock width', () =
 test('editing an existing design order never requires a connected Zalo account', () => {
   const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
   const handler = renderer.slice(renderer.indexOf("document.getElementById('design-save').onclick"), renderer.indexOf("document.getElementById('utility-panel-hide').onclick"));
-  assert.match(handler, /if \(!selectedDesignOrder\)/);
-  assert.match(handler, /resolveCrmConversation\(\{ quiet: true \}\)\.catch/);
+  assert.doesNotMatch(handler, /resolveCrmConversation|conversationId/);
   assert.match(handler, /selectedDesignOrder \? `\/orders\//);
   assert.doesNotMatch(handler, /alert\(/);
 });
@@ -228,14 +227,44 @@ test('profile badges count unread conversations up to 99+ and group scans can be
   const preload = fs.readFileSync(path.join(root, 'preload.js'), 'utf8');
   const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
   assert.match(preload, /sendUnreadConversationCount/);
-  assert.match(preload, /extractUnreadConversationCount/);
+  assert.match(preload, /__nyIsUnreadRow/);
+  assert.match(preload, /__nyCollectConversationRows/);
+  assert.match(preload, /sendUnreadCountDetail/);
   assert.match(main, /ipcMain\.on\('profile-unread-count'/);
+  assert.match(main, /ipcMain\.on\('profile-unread-count-detail'/);
   assert.match(renderer, /count > 99 \? '99\+'/);
   assert.match(html, /id="zalo-groups-minimize"/);
   assert.match(html, /id="zalo-groups-running-badge"/);
   assert.match(renderer, /setZaloGroupTaskRunning/);
   const switchHandler = main.slice(main.indexOf("ipcMain.on('switch-profile'"), main.indexOf("ipcMain.on('update-profile-settings'"));
   assert.doesNotMatch(switchHandler, /cancelProfileScans/);
+});
+
+test('conversation counters never mutate Zalo conversation row visibility', () => {
+  const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+  const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
+  const preload = fs.readFileSync(path.join(root, 'preload.js'), 'utf8');
+  const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  // Bug hoi quy: chip phai duoc gan click THAT (ham binder duoc GOI), khong chi dinh nghia.
+  assert.match(renderer, /^\s*bindConversationFilterChips\(\);/m);
+  assert.match(renderer, /^\s*updateConversationFilterVisibility\(\);/m);
+  // Chuoi 3 chang: renderer -> main -> preload.
+  assert.match(renderer, /ipcRenderer\.send\('conversation-filter:set'/);
+  assert.match(main, /ipcMain\.on\('conversation-filter:set'/);
+  assert.match(preload, /ipcRenderer\.on\('conversation-filter:set'/);
+  // Zalo virtualizes the list and owns inline display. Touching it can make history disappear.
+  const isolatedEngine = preload.slice(preload.indexOf('// ===== ENGINE LOC HOI THOAI'), preload.indexOf('// ===== di chan dong'));
+  assert.doesNotMatch(isolatedEngine, /removeProperty\('display'\)/);
+  assert.doesNotMatch(isolatedEngine, /setProperty\('display'/);
+  assert.doesNotMatch(isolatedEngine, /attributeFilter:\s*\[[^\]]*'style'/);
+  assert.match(html, /id="topbar-filter"[^>]*hidden/);
+  // Method B: cum chip nam ben TRAI, sat thuong hieu (giua .topbar-brand va .topbar-actions).
+  const brandIdx = html.indexOf('class="topbar-brand"');
+  const filterIdx = html.indexOf('id="topbar-filter"');
+  const actionsIdx = html.indexOf('class="topbar-actions"');
+  assert.ok(brandIdx >= 0 && filterIdx > brandIdx && actionsIdx > filterIdx, 'topbar-filter must be between brand and actions');
+  // Chi mot lan duy nhat (khong con ban trung trong .topbar-actions).
+  assert.equal(html.split('id="topbar-filter"').length - 1, 1);
 });
 
 test('font menu never hides the embedded Zalo BrowserView', () => {
@@ -484,8 +513,8 @@ test('Đơn Pancake tab is CRM-independent and offers a refresh handle for the o
   );
   assert.match(tabFn, /refreshCurrentButton\.hidden = tab !== 'orders'/);
   // renderCrmConnection an ca badge luon hop dang nhap CRM o tab orders.
-  assert.match(renderer, /toggle\.hidden = !crmConnected \|\| currentUtilityTab === 'quote' \|\| currentUtilityTab === 'orders'/);
-  assert.match(renderer, /box\.hidden = currentUtilityTab === 'quote' \|\| currentUtilityTab === 'orders'/);
+  assert.match(renderer, /toggle\.hidden = !crmConnected \|\| currentUtilityTab !== 'design'/);
+  assert.match(renderer, /box\.hidden = currentUtilityTab !== 'design'/);
 });
 
 test('Lưu thay đổi ghi len don Pancake dang mo va bao loi khi chua tai don', () => {
@@ -598,7 +627,7 @@ test('popup Da tao ma don neo duoi nut Tao don tren topbar va co nut Sao chep', 
   assert.match(renderer, /function showPancakeCreatePopup\(/);
   assert.match(renderer, /getElementById\('pancake-created-code'\)\.innerText = text/);
   assert.match(renderer, /popup\.classList\.add\('show'\)/);
-  assert.match(renderer, /clipboard\.writeText\(code\)/);
+  assert.match(renderer, /await copyTextSafely\(code, btn,/);
   assert.match(renderer, /getElementById\('pancake-created-close'\)\.onclick/);
   assert.match(renderer, /document\.addEventListener\('mousedown'/);
 });
@@ -739,11 +768,11 @@ test('v2.5.30 panel titles, scan button labels, and removed helper buttons', () 
   assert.match(renderer, /document\.getElementById\('zalo-users-select-50'\)\.onclick = toggleZaloUserSelect50/);
 });
 
-test('v2.5.30 Tạo đơn button auto-selects warehouse, creates 0đ placeholder if empty, shows result popup', () => {
+test('Tạo đơn button auto-selects warehouse, allows an empty 0đ order, and shows result popup', () => {
   const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
   assert.match(renderer, /function showPancakeCreatePopup\(mode, text, \{ cancelCode = '' \} = \{\}\)/);
   assert.match(renderer, /pancakeWarehouses\.find\(\(warehouse\) => warehouse\.allow_create_order\)/);
-  assert.match(renderer, /Đơn tạm 0đ \(tự tạo để lấy mã\)/);
+  assert.doesNotMatch(renderer, /Đơn tạm 0đ \(tự tạo để lấy mã\)|const first = catalog\[0\]/);
   assert.match(renderer, /\{ status: 6 \}/);
   // Loi Tao don (topbar) duoc render tren popup, khong im lang duoi crm-status
   assert.match(renderer, /showPancakeCreatePopup\('error'/);
@@ -784,34 +813,43 @@ test('v2.5.33 Nhóm Zalo panel-body scroll, docked height 100%, sticky header op
   assert.match(renderer, /document\.body\.classList\.add\('light-mode'\)/);
 });
 
-test('v2.5.39 Zalo stability: backgroundThrottling off, bounded auto-reload on failure, cache clean keeps login', () => {
+test('Zalo stability: matching UA, stateful recovery, modern view, and cache repair keeps login', () => {
   const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
   const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
   const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
-  // P0: BrowserView cua Zalo khong bi Chromium giam timer khi an (nhan tin den khong duoc cham)
-  assert.match(main, /new BrowserView\(\{ webPreferences: \{[^}]*backgroundThrottling: false/);
-  // P1a: tu tai lai khi loi — chi main frame, bo qua ERR_ABORTED (-3), gioi han 3 lan, cach 5 giay, reset khi tai xong
+  // WebContentsView thay BrowserView deprecated; Zalo giu realtime, nen tang khac duoc throttle.
+  assert.match(main, /const keepRealtime = profile\.platform === 'zalo'/);
+  assert.match(main, /new WebContentsView\(\{ webPreferences: \{[^}]*backgroundThrottling: !keepRealtime/);
+  assert.doesNotMatch(main, /new BrowserView\(/);
+  // Do not claim a newer Chrome than Electron actually embeds.
+  assert.doesNotMatch(main, /Chrome\/126\.0\.0\.0/);
+  assert.doesNotMatch(main, /loadURL\(url,\s*\{\s*userAgent:/);
+  // Reload only explicit main-frame network failures, with slow bounded backoff.
   assert.match(main, /did-fail-load', \(event, errorCode, errorDescription, validatedURL, isMainFrame\)/);
   assert.match(main, /if \(!isMainFrame \|\| errorCode === -3\) return;/);
-  assert.match(main, /const MAX_AUTO_RELOAD = 3;/);
-  assert.match(main, /setTimeout\(\(\) => \{ if \(!contents\.isDestroyed\(\)\) contents\.reload\(\); \}, 5000\)/);
+  assert.match(main, /new RecoveryController/);
+  assert.match(main, /recovery\.mainFrameFailed\(errorCode, errorDescription\)/);
   assert.match(main, /render-process-gone', \(event, details\)/);
-  assert.match(main, /details\.reason === 'clean-exit' \|\| details\.reason === 'killed'/);
+  assert.match(main, /recovery\.rendererGone\(details\.reason, details\.exitCode\)/);
   assert.match(main, /contents\.on\('unresponsive'/);
-  assert.match(main, /autoReloadAttempts = 0; \/\/ trang da tai xong/);
-  // P1b: don cache giu dang nhap — chi xoa HTTP cache, code cache, CacheStorage, ServiceWorker
-  assert.match(main, /ipcMain\.handle\('profile-clear-cache'/);
-  assert.match(main, /await sess\.clearCache\(\)/);
-  assert.match(main, /await sess\.clearCodeCaches\(\{\}\)/);
+  const unresponsiveHandler = main.slice(main.indexOf("contents.on('unresponsive'"), main.indexOf("contents.setWindowOpenHandler"));
+  assert.doesNotMatch(unresponsiveHandler, /contents\.reload\(/);
+  assert.match(main, /zalo-runtime\.jsonl/);
+  // Don nhe chi xoa HTTP/code cache; sua sau backup truoc khi lam moi ServiceWorker.
+  assert.match(main, /ipcMain\.handle\('profile-clear-cache-light'/);
+  assert.match(main, /ipcMain\.handle\('profile-repair-cache-deep'/);
+  assert.match(main, /backupPartitionCriticalData/);
   assert.match(main, /await sess\.clearStorageData\(\{ storages: \['cachestorage', 'serviceworkers'\] \}\)/);
   // khong duoc xoa cookies / localStorage / IndexedDB — mat tin nhan + mat dang nhap
   assert.doesNotMatch(main, /clearStorageData\(\{ storages: \[[^\]]*'cookies'/);
   assert.doesNotMatch(main, /clearStorageData\(\{ storages: \[[^\]]*'indexdb'/);
   assert.doesNotMatch(main, /clearStorageData\(\{ storages: \[[^\]]*'localstorage'/);
-  // UI: nut "Dọn cache (giữ đăng nhập)" trong modal chinh sua tai khoan
-  assert.match(html, /id="modal-clear-cache"[^>]*>Dọn cache \(giữ đăng nhập\)<\/button>/);
+  // UI tach hai muc va co xuat chan doan.
+  assert.match(html, /id="modal-clear-cache"[^>]*>Dọn cache nhẹ<\/button>/);
+  assert.match(html, /id="modal-repair-cache"[^>]*>Sửa cache sâu<\/button>/);
+  assert.match(html, /id="modal-export-diagnostics"[^>]*>Xuất chẩn đoán<\/button>/);
   assert.match(renderer, /getElementById\('modal-clear-cache'\)\.onclick/);
-  assert.match(renderer, /ipcRenderer\.invoke\('profile-clear-cache', editingProfile\.id\)/);
+  assert.match(renderer, /ipcRenderer\.invoke\('profile-clear-cache-light', editingProfile\.id\)/);
   assert.match(renderer, /getElementById\('modal-clear-cache'\)\.style\.display = profileToEdit \? 'inline-flex' : 'none'/);
 });
 
@@ -842,4 +880,56 @@ test('v2.5.40 conversation diag: đếm hội thoại Zalo sau khi tải, chỉ 
   assert.match(renderer, /zalo-diag-.*payload\.profileId/);
   assert.match(renderer, /< 60000\) return;/);
   assert.match(renderer, /Dọn cache \(giữ đăng nhập\)/);
+});
+
+
+test('design orders connect directly to Nh? Y?n POS without legacy Zalo CRM mapping', () => {
+  const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+  const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
+  const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  assert.match(html, /id="crm-base-url"[^>]*value="https:\/\/nhayenpos\.web\.app"/);
+  assert.match(html, /K&#7871;t n&#7889;i Nh&#224; Y&#7871;n POS/);
+  assert.match(renderer, /localStorage\.getItem\('nha-yen-pos-url'\) \|\| 'https:\/\/nhayenpos\.web\.app'/);
+  assert.match(renderer, /await Promise\.allSettled\(\[loadDesigners\(\), loadDesignOrders\(\)\]\)/);
+  assert.doesNotMatch(renderer.slice(renderer.indexOf("document.getElementById('crm-login').onclick"), renderer.indexOf("const mappingSaveButton")), /resolveCrmConversation|crm-account-select|syncQuickRepliesFromCrm/);
+  const saveHandler = renderer.slice(renderer.indexOf("document.getElementById('design-save').onclick"), renderer.indexOf("document.getElementById('utility-panel-hide').onclick"));
+  assert.doesNotMatch(saveHandler, /resolveCrmConversation|conversationId/);
+  const loginHandler = main.slice(main.indexOf("ipcMain.handle('crm:login'"), main.indexOf("ipcMain.handle('crm:logout'"));
+  assert.doesNotMatch(loginHandler, /zalo-accounts/);
+  assert.match(loginHandler, /payload\.baseUrl \|\| 'https:\/\/nhayenpos\.web\.app'/);
+  assert.match(main, /replace\(\/\\\/orders\$\/i, ''\)/);
+});
+
+test('design editor syncs order flags and renders shared POS activity history', () => {
+  const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+  const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
+
+  assert.match(html, /id="design-urgent"/);
+  assert.match(html, /id="design-fee"/);
+  assert.match(html, /id="design-outsource"/);
+  assert.match(html, /id="design-activity"/);
+  assert.match(html, /Chưa có hoạt động/);
+
+  const fillForm = renderer.slice(renderer.indexOf('function fillDesignForm('), renderer.indexOf('function showDesignListView'));
+  assert.match(fillForm, /design-urgent'\)\.checked = !!order\?\.isUrgent/);
+  assert.match(fillForm, /design-fee'\)\.checked = !!order\?\.hasDesignFee/);
+  assert.match(fillForm, /design-outsource'\)\.checked = !!order\?\.isOutsource/);
+  assert.match(fillForm, /renderDesignActivity\(order\?\.activities \|\| order\?\.statusHistory \|\| \[\]\)/);
+
+  const saveHandler = renderer.slice(renderer.indexOf("document.getElementById('design-save').onclick"), renderer.indexOf("document.getElementById('utility-panel-hide').onclick"));
+  assert.match(saveHandler, /isUrgent: document\.getElementById\('design-urgent'\)\.checked/);
+  assert.match(saveHandler, /hasDesignFee: document\.getElementById\('design-fee'\)\.checked/);
+  assert.match(saveHandler, /isOutsource: document\.getElementById\('design-outsource'\)\.checked/);
+});
+
+test('quick Pancake order posts an empty item list without choosing a catalog product', () => {
+  const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
+  const payloadFn = renderer.slice(renderer.indexOf('function pancakeOrderPayload('), renderer.indexOf('function normalizePancakeOrder'));
+  const createHandler = renderer.slice(renderer.indexOf("document.getElementById('pancake-topbar-create').onclick"), renderer.indexOf("document.getElementById('pancake-created-copy').onclick"));
+
+  assert.doesNotMatch(payloadFn, /if \(!pancakeItems\.length\) throw/);
+  assert.match(payloadFn, /items: pancakeItems\.map/);
+  assert.doesNotMatch(createHandler, /loadPancakeProductCatalog|catalog\[0\]|variation_id: first\.id/);
+  assert.match(createHandler, /const payload = pancakeApiPayload\(pancakeOrderPayload\(\)\)/);
+  assert.match(createHandler, /const emptyOrder = pancakeItems\.length === 0/);
 });
