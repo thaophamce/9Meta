@@ -41,6 +41,30 @@
         }
       ]
     },
+    "mac": {
+      "icon": "icon.png",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.business"
+    },
+    "dmg": {
+      "artifactName": "Nha-Yen-Zalo-Setup-${version}-${arch}.${ext}",
+      "sign": false
+    },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
