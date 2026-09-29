@@ -1260,6 +1260,7 @@ function setupWebContents(contents, profileId) {
     if (params.mediaType === 'image') {
       menu.append(new MenuItem({ type: 'separator' }));
       menu.append(new MenuItem({ label: '💾 Lưu ảnh', click: () => contents.downloadURL(params.srcURL) }));
+      menu.append(new MenuItem({ label: '📋 Sao chép ảnh', click: () => contents.copyImageAt(params.x, params.y) }));
     }
     menu.append(new MenuItem({ type: 'separator' }));
     menu.append(new MenuItem({ label: '🔄 Tải lại trang', click: () => contents.reload() }));

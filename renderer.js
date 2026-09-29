@@ -932,7 +932,7 @@ function fillDesignForm(order = null) {
   document.getElementById('design-current-group').innerText = order ? `Chỉnh sửa ${order.orderCode || 'đơn thiết kế'}` : 'Tạo đơn thiết kế';
   document.getElementById('design-code').value = order?.orderCode || extractOrderCode(currentChatSnapshot?.name || '');
   document.getElementById('design-status').value = order?.status || 'demo';
-  document.getElementById('design-files').value = String(order?.fileCount || 0);
+  document.getElementById('design-files').value = order ? String(order.fileCount ?? 0) : '1';
   document.getElementById('design-deadline').value = order?.deadline ? String(order.deadline).slice(0, 10) : '';
   document.getElementById('design-designer').value = order?.designerId || order?.designer?.id || '';
   document.getElementById('design-note').value = order?.notes || '';
@@ -3129,19 +3129,40 @@ document.getElementById('pancake-topbar-create').onclick = async () => {
       if (preferred) select.value = preferred.id;
     }
     if (!pancakeWarehouses.length) throw new Error('Chưa có thông tin kho hàng. Hãy mở tab Pancake để tải lại danh sách kho.');
-    const emptyOrder = pancakeItems.length === 0;
-    if (emptyOrder) button.innerText = 'Đang tạo đơn trống 0đ…';
-    const payload = pancakeApiPayload(pancakeOrderPayload());
+    button.innerText = 'Đang tạo đơn trống 0đ…';
+    // Luon tao don trang: chi giu warehouse_id, con lai rong — khong copy tu form cu.
+    const emptyPayload = {
+      warehouse_id: select.value,
+      bill_full_name: '',
+      bill_phone_number: '',
+      shipping_address: { address: '', full_address: '', full_name: '', phone_number: '' },
+      items: [],
+      shipping_fee: 0,
+      total_discount: 0,
+      charged_by_qrpay: 0,
+      note: '',
+      note_print: '',
+      is_free_shipping: false,
+    };
+    const payload = pancakeApiPayload(emptyPayload);
     const result = await pancakeRequest('/shops/609730/orders', 'POST', payload);
     const order = result.data || result.order || result;
     const code = String(order.orderCode || order.display_id || order.id || '');
     document.getElementById('crm-status').innerText = `Đã tạo đơn ${code}`;
-    showPancakeCreatePopup('success', code, { cancelCode: emptyOrder ? code : '' });
-    // Chi reload don vua tao khi co san pham; don trong 0d khong ghi de form dang nhap.
-    if (!emptyOrder) {
-      await loadPancakeOrderDetail(code).catch(() => {});
-      await loadPancakeOrders().catch(() => {});
-    }
+    showPancakeCreatePopup('success', code, { cancelCode: code });
+    // Reset form ve trang ngay, khong hoi confirm — don moi trang 100%
+    currentPancakeLink = null;
+    ['pancake-customer', 'pancake-phone', 'pancake-address', 'pancake-note', 'pancake-print-note'].forEach((id) => { const el = document.getElementById(id); if (el) el.value = ''; });
+    ['pancake-shipping', 'pancake-discount', 'pancake-deposit'].forEach((id) => { const el = document.getElementById(id); if (el) el.value = '0'; });
+    const chip = document.getElementById('pancake-customer-chip-name');
+    if (chip) chip.innerText = 'Chưa xác định khách hàng';
+    pancakeItems = [];
+    renderPancakeItems();
+    renderPancakeSummary();
+    const box = document.getElementById('pancake-current');
+    if (box) box.innerHTML = '<span class="mapping-state">Tìm thủ công</span><h4>Đơn mới — trắng thông tin</h4><p>Mã mới đã tạo, form đã reset. Nhập thông tin cho đơn tiếp theo.</p>';
+    document.getElementById('pancake-search').value = code;
+    await loadPancakeOrders().catch(() => {});
   } catch (error) {
     const message = error?.message || 'Không tạo được đơn.';
     document.getElementById('crm-status').innerText = message;
