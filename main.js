@@ -29,6 +29,18 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const IS_TEST_DISTRIBUTION = require('./package.json').testDistribution === true;
+// Migrate tu %AppData%/9meta cu sang %AppData%/Nhayenzalo moi (lan dau cai 2.5.54+)
+if (!IS_TEST_DISTRIBUTION && process.platform === 'win32') {
+  try {
+    const legacyDataPath = path.join(app.getPath('appData'), '9meta');
+    const newDataPath = path.join(app.getPath('appData'), 'Nhayenzalo');
+    if (fs.existsSync(legacyDataPath) && !fs.existsSync(newDataPath)) {
+      fs.mkdirSync(path.dirname(newDataPath), { recursive: true });
+      fs.cpSync(legacyDataPath, newDataPath, { recursive: true, force: false, errorOnExist: false });
+      console.log('[Migrate] Copied legacy 9meta userData -> Nhayenzalo');
+    }
+  } catch (e) { console.error('[Migrate] legacy 9meta -> Nhayenzalo failed:', e?.message || e); }
+}
 if (IS_TEST_DISTRIBUTION) {
   const testDataPath = path.join(app.getPath('appData'), 'NhaYenZalo-Test');
   fs.mkdirSync(testDataPath, { recursive: true });
