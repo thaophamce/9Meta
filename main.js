@@ -29,15 +29,36 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const IS_TEST_DISTRIBUTION = require('./package.json').testDistribution === true;
-// Migrate tu %AppData%/9meta cu sang %AppData%/Nhayenzalo moi (lan dau cai 2.5.54+)
+// Migrate tu %AppData%/9meta cu sang %AppData%/Nhayenzalo moi (2.5.54+ doi ten package).
+// Luc app chay lan dau voi ten moi, Electron da tao %AppData%/Nhayenzalo trong nen copy nguyen folder se skip.
+// Can copy rieng tung thu muc/file quan trong neu chua co o dich.
 if (!IS_TEST_DISTRIBUTION && process.platform === 'win32') {
   try {
     const legacyDataPath = path.join(app.getPath('appData'), '9meta');
     const newDataPath = path.join(app.getPath('appData'), 'Nhayenzalo');
-    if (fs.existsSync(legacyDataPath) && !fs.existsSync(newDataPath)) {
-      fs.mkdirSync(path.dirname(newDataPath), { recursive: true });
+    if (fs.existsSync(legacyDataPath) && fs.existsSync(newDataPath)) {
+      const critical = ['Partitions', 'workspaces', 'settings.json', 'secure-key.bin', 'secure-meta.json', 'media', 'quick-reply-images', 'backups'];
+      for (const name of critical) {
+        const src = path.join(legacyDataPath, name);
+        const dest = path.join(newDataPath, name);
+        if (!fs.existsSync(src) || fs.existsSync(dest)) continue;
+        try {
+          fs.cpSync(src, dest, { recursive: true, force: false, errorOnExist: false });
+          console.log(`[Migrate] Copied ${name} 9meta -> Nhayenzalo`);
+        } catch (e) { console.error(`[Migrate] copy ${name} failed:`, e?.message || e); }
+      }
+      // Cac file config le neu chua co: Preferences, Local State, Network...
+      const extraFiles = ['Preferences', 'Local State', 'DIPS', 'DIPS-wal'];
+      for (const name of extraFiles) {
+        const src = path.join(legacyDataPath, name);
+        const dest = path.join(newDataPath, name);
+        if (fs.existsSync(src) && !fs.existsSync(dest)) {
+          try { fs.copyFileSync(src, dest); } catch {}
+        }
+      }
+    } else if (fs.existsSync(legacyDataPath) && !fs.existsSync(newDataPath)) {
       fs.cpSync(legacyDataPath, newDataPath, { recursive: true, force: false, errorOnExist: false });
-      console.log('[Migrate] Copied legacy 9meta userData -> Nhayenzalo');
+      console.log('[Migrate] Copied legacy 9meta userData -> Nhayenzalo (full)');
     }
   } catch (e) { console.error('[Migrate] legacy 9meta -> Nhayenzalo failed:', e?.message || e); }
 }
