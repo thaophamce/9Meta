@@ -231,6 +231,10 @@ function releasePopupDock() {
   ipcRenderer.send('set-popup-width', 0);
 }
 function openOverlay(id) {
+  if (id !== 'lock-overlay' && !storeUnlocked) {
+    showSecureOverlay();
+    return false;
+  }
   setUtilityPanelOpen(false);
   for (const overlayId of overlayIds) {
     if (overlayId !== id) {
@@ -272,6 +276,7 @@ function toggleToolOverlay(id) {
   return shouldOpen;
 }
 function closeOverlay(id) {
+  if (id === 'lock-overlay' && !storeUnlocked) return false;
   document.getElementById(id).style.display = 'none';
   document.querySelectorAll('.nav-tool').forEach((button) => {
     if (TOOL_OVERLAY_BY_ACTION[button.dataset.toolAction] === id) button.classList.remove('active');
@@ -1406,7 +1411,7 @@ function migrateLegacyProfiles() {
       workspaceData.quickReplies = settings.quickReplies || [];
     } catch (e) { }
   }
-  persistWorkspace();
+  if (storeUnlocked) persistWorkspace();
 }
 
 function renderSidebar() {
@@ -1891,19 +1896,18 @@ function renderQuickReplies() {
           : `<img class="qr-thumb" loading="lazy" src="${quickReplyFileUrl(entry.imagePath)}" alt="Ảnh mẫu" data-preview-index="${entry.__index}">`;
       const full = String(entry.message || '');
       const short = full.length > 80 ? `${full.slice(0, 80)}…` : full;
-      return `<tr class="${isBroken ? 'qr-row-warning' : ''}">
+      return `<tr class="qr-main-row ${isBroken ? 'qr-row-warning' : ''}">
         <td>${entry.__index + 1}</td>
         <td><span class="qr-keyword">&#92;${escapeHtml(entry.__keyword)}</span></td>
         <td>${imageCell}</td>
-        <td class="qr-content" title="${escapeHtml(full)}">${escapeHtml(short)}</td>
         <td><div class="row-actions">
           <button class="modal-btn cancel" type="button" title="Sửa" aria-label="Sửa mẫu" data-qr-edit="${entry.__index}">Sửa</button>
           <button class="modal-btn warn" type="button" title="Xoá" aria-label="Xoá mẫu" data-qr-delete="${entry.__index}">Xoá</button>
           <button class="modal-btn" type="button" title="Chèn vào hội thoại đang mở" aria-label="Chèn mẫu" data-qr-insert="${entry.__index}">Chèn</button>
         </div></td>
-      </tr>`;
+      </tr><tr class="qr-content-row ${isBroken ? 'qr-row-warning' : ''}"><td colspan="4"><span class="qr-content" title="${escapeHtml(full)}">${escapeHtml(short)}</span></td></tr>`;
     }).join('')
-    : '<tr><td colspan="5" class="muted">Không có mẫu nào khớp từ khóa tìm.</td></tr>';
+    : '<tr><td colspan="4" class="muted">Không có mẫu nào khớp từ khóa tìm.</td></tr>';
 
   rows.querySelectorAll('[data-qr-edit]').forEach((button) => {
     button.onclick = () => openQuickReplyEditor(Number(button.getAttribute('data-qr-edit')));
@@ -2255,14 +2259,21 @@ nameInput.addEventListener('input', updateAvatarPreview);
 
 document.querySelectorAll('[data-close]').forEach((button) => { button.onclick = () => closeOverlay(button.getAttribute('data-close')); });
 document.querySelectorAll('.overlay').forEach((overlay) => {
-  overlay.addEventListener('mousedown', (event) => { if (event.target === overlay) closeOverlay(overlay.id); });
+  overlay.addEventListener('mousedown', (event) => {
+    if (event.target !== overlay) return;
+    if (overlay.id === 'lock-overlay' && !storeUnlocked) return;
+    closeOverlay(overlay.id);
+  });
 });
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
   const open = overlayIds.find((id) => document.getElementById(id)?.style.display === 'flex');
   if (open) closeOverlay(open);
 });
-document.getElementById('btn-add-profile').onclick = () => openModal();
+document.getElementById('btn-add-profile').onclick = () => {
+  if (!refreshSecureStatus()) return;
+  openModal();
+};
 document.getElementById('modal-cancel').onclick = () => closeOverlay('modal-overlay');
 document.getElementById('modal-clear-cache').onclick = async () => {
   if (!editingProfile) return;
@@ -2331,33 +2342,55 @@ document.getElementById('modal-delete').onclick = () => {
   if (activeProfileId) switchProfile(activeProfileId);
 };
 document.getElementById('modal-save').onclick = () => {
-  const name = nameInput.value.trim() || `Tài khoản ${profiles.length + 1}`;
-  const customUrl = document.getElementById('profile-custom-url-input').value.trim();
-  if (platformInput.value === 'custom' && !customUrl) return alert('Vui lòng nhập URL cho Custom Link.');
-  if (editingProfile) {
-    const nextPlatform = platformInput.value;
-    const previousPlatform = editingProfile.platform || 'zalo';
-    editingProfile.name = name;
-    editingProfile.proxy = proxyInput.value.trim();
-    editingProfile.platform = nextPlatform;
-    editingProfile.avatar = tempAvatarPath;
-    editingProfile.customUrl = nextPlatform === 'custom' ? customUrl : '';
-    if (previousPlatform !== nextPlatform) {
-      editingProfile.partition = createProfilePartition(editingProfile.id, nextPlatform);
+  if (!refreshSecureStatus()) return;
+  const saveButton = document.getElementById('modal-save');
+  const previousProfiles = profiles.map((profile) => ({ ...profile }));
+  const previousActiveProfileId = activeProfileId;
+  const previousWorkspaceData = normalizeWorkspaceData(workspaceData);
+  try {
+    saveButton.disabled = true;
+    saveButton.innerText = 'Đang lưu…';
+    const name = nameInput.value.trim() || `Tài khoản ${profiles.length + 1}`;
+    const customUrl = document.getElementById('profile-custom-url-input').value.trim();
+    if (platformInput.value === 'custom' && !customUrl) throw new Error('Vui lòng nhập URL cho Custom Link.');
+    let eventType;
+    let eventProfileId;
+    if (editingProfile) {
+      const nextPlatform = platformInput.value;
+      const previousPlatform = editingProfile.platform || 'zalo';
+      editingProfile.name = name;
+      editingProfile.proxy = proxyInput.value.trim();
+      editingProfile.platform = nextPlatform;
+      editingProfile.avatar = tempAvatarPath;
+      editingProfile.customUrl = nextPlatform === 'custom' ? customUrl : '';
+      if (previousPlatform !== nextPlatform) editingProfile.partition = createProfilePartition(editingProfile.id, nextPlatform);
+      eventType = 'profile_updated';
+      eventProfileId = editingProfile.id;
+    } else {
+      const id = createProfileId();
+      const platform = platformInput.value;
+      profiles.push({ id, name, avatar: tempAvatarPath, partition: createProfilePartition(id, platform), platform, proxy: proxyInput.value.trim(), customUrl: platform === 'custom' ? customUrl : '' });
+      activeProfileId = id;
+      eventType = 'profile_created';
+      eventProfileId = id;
     }
-    ipcRenderer.send('update-profile-settings', editingProfile);
-    trackEvent('profile_updated', { id: editingProfile.id });
-  } else {
-    const id = createProfileId();
-    const platform = platformInput.value;
-    profiles.push({ id, name, avatar: tempAvatarPath, partition: createProfilePartition(id, platform), platform, proxy: proxyInput.value.trim(), customUrl: platform === 'custom' ? customUrl : '' });
-    activeProfileId = id;
-    trackEvent('profile_created', { id });
+    workspaceData.analyticsEvents.unshift({ id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`, type: eventType, payload: { id: eventProfileId }, createdAt: Date.now() });
+    workspaceData.analyticsEvents = workspaceData.analyticsEvents.slice(0, 120);
+    persistWorkspace();
+    if (editingProfile) ipcRenderer.send('update-profile-settings', editingProfile);
+    closeOverlay('modal-overlay');
+    renderAll();
+    if (activeProfileId) switchProfile(activeProfileId);
+  } catch (error) {
+    profiles = previousProfiles;
+    activeProfileId = previousActiveProfileId;
+    workspaceData = previousWorkspaceData;
+    if (String(error?.message || error).includes('Dữ liệu đang khóa')) showSecureOverlay();
+    alert(`Không lưu được tài khoản: ${error?.message || error}`);
+  } finally {
+    saveButton.disabled = false;
+    saveButton.innerText = 'Lưu';
   }
-  persistWorkspace();
-  closeOverlay('modal-overlay');
-  renderAll();
-  if (activeProfileId) switchProfile(activeProfileId);
 };
 
 const legacyToolsLauncher = document.getElementById('btn-tools-launcher');
@@ -2792,7 +2825,17 @@ function hideLockOverlay() {
 }
 
 // ---- Overlay bắt buộc: nhập master password (đã set sẵn) + mã hoá at-rest ----
-let storeUnlocked = true; // giả định đã mở; main gửi need-master-password nếu chưa
+// Mặc định an toàn là đang khóa. Chỉ main process mới được xác nhận đã mở khóa.
+let storeUnlocked = false;
+function refreshSecureStatus(options = {}) {
+  let status = null;
+  try { status = ipcRenderer.sendSync('secure-status-sync'); } catch {}
+  const unlocked = !!(status && status.trusted && status.unlocked && !status.locked);
+  storeUnlocked = unlocked;
+  appLocked = !unlocked;
+  if (!unlocked && options.showOverlay !== false) showSecureOverlay();
+  return unlocked;
+}
 function setSecureRememberVisible(visible) {
   const el = document.getElementById('secure-remember-row');
   if (el) el.style.display = visible ? 'block' : 'none';
@@ -3330,6 +3373,7 @@ document.getElementById('video-library-stage').onclick = async () => {
 
 
 
+refreshSecureStatus({ showOverlay: false });
 migrateLegacyProfiles();
 renderAll();
 renderQuote();
@@ -3337,6 +3381,7 @@ renderUtilityContext();
 setUtilityPanelOpen(false);
 if (activeProfileId) switchProfile(activeProfileId);
 ipcRenderer.send('renderer-ready');
+if (!storeUnlocked) showSecureOverlay();
 ipcRenderer.send('get-downloads');
 
 ipcRenderer.on('recent-chats', (event, info) => {

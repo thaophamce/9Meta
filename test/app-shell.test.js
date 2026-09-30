@@ -438,6 +438,18 @@ test('v2.5.34 at-rest encryption: master password unlock, encrypted settings/dat
   assert.match(renderer, /showSecureOverlay/);
 });
 
+test('locked secure store cannot be bypassed before adding or saving a profile', () => {
+  const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
+  assert.match(main, /ipcMain\.on\('secure-status-sync'/);
+  assert.match(main, /code:\s*'STORE_LOCKED'/);
+  assert.match(main, /code:\s*'WRITE_FAILED'/);
+  assert.match(renderer, /let storeUnlocked = false/);
+  assert.match(renderer, /if \(id === 'lock-overlay' && !storeUnlocked\) return false/);
+  assert.match(renderer, /btn-add-profile'[\s\S]*?refreshSecureStatus\(\)/);
+  assert.match(renderer, /modal-save'[\s\S]*?refreshSecureStatus\(\)/);
+});
+
 test('v2.5.34 preset master password: nhân viên phải nhập đúng mật khẩu chủ đã set sẵn, plaintext không lộ trong mã nguồn', () => {
   const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
   // Salt + hash PBKDF2 phải có trong main.js; KHÔNG được chứa plaintext password.
@@ -930,6 +942,8 @@ test('quick Pancake order posts an empty item list without choosing a catalog pr
   assert.doesNotMatch(payloadFn, /if \(!pancakeItems\.length\) throw/);
   assert.match(payloadFn, /items: pancakeItems\.map/);
   assert.doesNotMatch(createHandler, /loadPancakeProductCatalog|catalog\[0\]|variation_id: first\.id/);
-  assert.match(createHandler, /const payload = pancakeApiPayload\(pancakeOrderPayload\(\)\)/);
-  assert.match(createHandler, /const emptyOrder = pancakeItems\.length === 0/);
+  assert.match(createHandler, /const emptyPayload = \{/);
+  assert.match(createHandler, /items: \[\]/);
+  assert.match(createHandler, /const payload = pancakeApiPayload\(emptyPayload\)/);
+  assert.doesNotMatch(createHandler, /pancakeOrderPayload\(\)/);
 });
